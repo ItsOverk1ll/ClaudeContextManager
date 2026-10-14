@@ -7,6 +7,9 @@
 #   ccm push            commit and push the Context folder to its GitHub repo
 #   ccm import <path>   import a claude.ai data export (.zip or folder) - Claude Desktop chats
 #   ccm open            open the Context folder in Explorer
+#   ccm search [words]  search all your context   (--project=<name> to search one project)
+#   ccm summary <project>   write the project's "where we left off" summary now (--all: every project)
+#   ccm cleanup [project ...]   archive old/tiny sessions and shrink transcripts (no project: pick them)
 #   ccm plugins         browse plugins (e.g. Codex) and install them
 #   ccm plugin install <name>   install or update a plugin   (also: plugin remove <name>, plugin list)
 #   ccm uninstall       remove the hook, scheduled task and the ccm / ClaudeContextManager commands (keeps your Context folder)
@@ -19,6 +22,7 @@ $params = @($Rest | Where-Object { $_ -notlike '--*' })
 
 # The Claude Code hook calls `sync --background`: hand off to a hidden process so the session can exit right away
 if ($Command -eq 'sync' -and '--background' -in $flags) {
+    if ($env:CCM_SUMMARIZING) { exit 0 }      # a summary's own claude run: never sync from inside it
     $pwsh = (Get-Process -Id $PID).Path
     Start-Process $pwsh -WindowStyle Hidden -ArgumentList '-NoProfile', '-File', "`"$PSCommandPath`"", 'sync', '--quiet'
     exit 0
@@ -51,6 +55,12 @@ function Invoke-Setup {
     $config.AutoSort = Read-YesNo 'Sort context into projects automatically?' $true
     if (-not $config.AutoSort) { Write-Info "New context will go to $Unsorted for you to sort from the menu (Ctrl+V)." }
     $config.Redact = Read-YesNo 'Redact API keys, tokens and passwords in saved context?' $true
+    Write-Host ''
+    Write-Info "Each project can have a short 'where we left off' summary (shown at the top of PROJECT.md),"
+    Write-Info 'written by Claude from your sessions. Automatic mode refreshes it in the background after syncs'
+    Write-Info "when a project has new sessions (at most every $($config.SummaryMinHours) hours, using the small $($config.SummaryModel) model and your Claude usage)."
+    $config.Summaries = if (Read-YesNo 'Write summaries automatically?' $true) { 'auto' } else { 'manual' }
+    if ($config.Summaries -eq 'manual') { Write-Info 'You can write one any time: Ctrl+W in a project.' }
     Save-Config $config
     New-Item -ItemType Directory -Force $config.ContextDir | Out-Null
 
@@ -169,12 +179,16 @@ function Show-ProjectMenu($config, $project) {
             $pin = if ($e.auto) { ' ' } else { "$green•$reset" }
             $rows += "$dim$($e.updated.Substring(5, 5))$reset$pin{0,-40} $dim{1,-7}{2,3}p$reset`t{3}`t{4}" -f (Get-OneLine $e.title 40), $src, $e.prompts, $s.Key, (Join-Path $config.ContextDir $e.file)
         }
-        $header = "Enter open  ·  Ctrl+V move to project  ·  Ctrl+R resume session  ·  Esc back`n" +
-            "Ctrl+Y copy  ·  Ctrl+D remove  ·  Ctrl+O folder  ·  $(if ($ProjectActions.Count) { 'Ctrl+P plugins  ·  ' })$green•$reset sorted by hand"
-        $pick = Show-Menu $rows $project $header -Expect 'ctrl-v', 'ctrl-r', 'ctrl-y', 'ctrl-d', 'ctrl-o', 'ctrl-p' -Preview
+        $header = "Enter open  ·  Ctrl+V move to project  ·  Ctrl+R resume session  ·  Ctrl+F search  ·  Esc back`n" +
+            "Ctrl+W write summary  ·  Ctrl+K clean up  ·  Ctrl+Y copy  ·  Ctrl+D remove  ·  Ctrl+O folder`n" +
+            "$(if ($ProjectActions.Count) { 'Ctrl+P plugins  ·  ' })$green•$reset sorted by hand"
+        $pick = Show-Menu $rows $project $header -Expect 'ctrl-v', 'ctrl-r', 'ctrl-y', 'ctrl-d', 'ctrl-o', 'ctrl-p', 'ctrl-w', 'ctrl-k', 'ctrl-f' -Preview
         if (-not $pick) { return }
         if ($pick.Key -eq 'ctrl-o') { Start-Process explorer.exe $dir; continue }
         if ($pick.Key -eq 'ctrl-p') { Show-ProjectActions $config $project; continue }
+        if ($pick.Key -eq 'ctrl-f') { Show-Search $config $project; continue }
+        if ($pick.Key -eq 'ctrl-k') { Invoke-CleanupWizard $config @($project); continue }
+        if ($pick.Key -eq 'ctrl-w') { Write-SummaryNow $config $project; continue }
         if (-not $pick.Row) { continue }
         $id = $pick.Row
         $path = if ($id -like 'file:*') { Join-Path $dir $id.Substring(5) } else { Join-Path $config.ContextDir $index[$id].file }
@@ -203,6 +217,92 @@ function Show-ProjectMenu($config, $project) {
             default { Open-File $path }
         }
     }
+}
+
+function Write-SummaryNow($config, $project) {
+    Clear-Host
+    Write-Info "Writing the 'where we left off' summary for $project with Claude ($($config.SummaryModel))..."
+    try { Update-ProjectSummary $config $project; Write-Ok 'Done. It is at the top of PROJECT.md (and in SUMMARY.md).' }
+    catch { Write-Warn "$_" }
+    Start-Sleep -Milliseconds 1200
+}
+
+# Full-text search over the Context folder: ripgrep when installed, otherwise Windows' findstr.
+# fzf re-runs the search on every keystroke; the preview jumps to the matching line.
+function Show-Search($config, [string]$project = '', [string]$query = '') {
+    $root = $config.ContextDir
+    $scope = if ($project) { "`"$(Get-SafeName $project)`"" } else { '.' }
+    $rg = Get-Command rg -ErrorAction SilentlyContinue
+    $mdFiles = if ($project) { '"' + (Get-SafeName $project) + '\*.md"' } else { '*.md' }
+    $find = if ($rg) { "rg --line-number --no-heading --color=always --smart-case --fixed-strings --max-columns=300 --max-columns-preview -g *.md -- {q} $scope" }
+        else { "findstr /s /i /n /p /c:{q} $mdFiles" }
+    $reload = "if {q}==`"`" (echo.) else ($find)"
+    $style = @($fzfStyle | Where-Object { $_ -notlike '--delimiter=*' -and $_ -notlike '--with-nth=*' })
+    $label = if ($project) { " Search $project " } else { ' Search all context ' }
+    $editor = Get-Editor
+    while ($true) {
+        Push-Location $root
+        try {
+            $out = @(& $fzf @style '--disabled' '--delimiter=:' "--border-label=$label" "--query=$query" `
+                "--header=Type to search  ·  Enter open at the line  ·  Ctrl+O open the project  ·  Esc back$(if (-not $rg) { "`n${dim}Faster search: winget install BurntSushi.ripgrep.MSVC$reset" })" `
+                '--expect=ctrl-o' '--print-query' "--bind=start:reload:$reload" "--bind=change:reload:$reload" `
+                '--preview=type {1}' '--preview-window=right,55%,wrap,border-left,+{2}-/2')
+        } finally { Pop-Location }
+        if ($out.Count -lt 3 -or -not $out[2]) { return }
+        $query = $out[0]
+        $m = [regex]::Match(($out[2] -replace '\e\[[0-9;]*m', ''), '^(.+?):(\d+):')
+        if (-not $m.Success) { return }
+        $file = Join-Path $root ($m.Groups[1].Value -replace '^\.[\\/]', '')
+        $line = $m.Groups[2].Value
+        if ($out[1] -eq 'ctrl-o') {
+            $proj = ($m.Groups[1].Value -replace '^\.[\\/]', '' -split '[\\/]')[0]
+            Show-ProjectMenu $config $proj
+            return
+        }
+        if ($editor -eq 'code') { & code -g "${file}:$line" } else { Open-File $file }
+    }
+}
+
+function Select-Projects($config, [string]$title) {
+    $stats = Get-ProjectStats $config
+    $names = @($stats.Keys | Where-Object { $_ -ne $Global } | Sort-Object)
+    $rows = $names | ForEach-Object { "{0,-30} $dim{1,3} sessions$reset`t{0}" -f $_, $stats[$_].Sessions }
+    $style = @($fzfStyle) + @('--multi', "--border-label= $title ", '--header=Tab select (any number)  ·  Enter done  ·  Esc cancel')
+    $out = @($rows | & $fzf @style)
+    @($out | Where-Object { $_ } | ForEach-Object { ($_ -split "`t")[1] })
+}
+
+function Invoke-CleanupWizard($config, [string[]]$projects) {
+    Clear-Host
+    if (-not $projects) { Write-Info 'No projects chosen.'; Start-Sleep 1; return }
+    Write-Host "`n  ${green}Clean up$reset $dim$($projects -join ', ')$reset`n"
+    Write-Info 'Removed sessions are kept in a zip archive (unless you say no) and are never imported again.'
+    Write-Host ''
+    $days = Read-Value 'Remove sessions not updated in how many days? (0 = keep all)' '180'
+    $options = @{
+        OlderThanDays = [int]($days -replace '\D', '')
+        Tiny = Read-YesNo 'Remove tiny sessions (1 prompt or less)?' $true
+        Compact = Read-YesNo 'Shrink the other sessions (drop tool-call lines, keep prompts and replies)?' $false
+        Archive = $true
+    }
+    $plan = Get-CleanupPlan $config $projects $options
+    if (-not $plan.Remove.Count -and -not $plan.Compact.Count) { Write-Ok 'Nothing to clean up.'; Wait-Key; return }
+    Write-Host ''
+    if ($plan.Remove.Count) {
+        Write-Host "  Remove $($plan.Remove.Count) session(s), $(Format-Bytes $plan.RemoveBytes):"
+        foreach ($r in $plan.Remove | Select-Object -First 12) { Write-Info "  $($r.Entry.updated.Substring(0, 10))  $(Get-OneLine $r.Entry.title 50)  ($($r.Reason))" }
+        if ($plan.Remove.Count -gt 12) { Write-Info "  ... and $($plan.Remove.Count - 12) more" }
+        $options.Archive = Read-YesNo 'Keep a zip archive of the removed sessions?' $true
+    }
+    if ($plan.Compact.Count) { Write-Host "  Shrink $($plan.Compact.Count) session(s)." }
+    if (-not (Read-YesNo 'Go ahead?' $false)) { Write-Info 'Nothing changed.'; Start-Sleep 1; return }
+    try {
+        $r = Invoke-Cleanup $config $projects $options
+        Write-Ok "Removed $($r.Removed) session(s) ($(Format-Bytes $r.RemovedBytes)), shrank $($r.Compacted) ($(Format-Bytes $r.CompactBytes) saved)."
+        if ($r.Archive) { Write-Info "Archive: $($r.Archive)" }
+        if ($config.Repo) { Write-Info 'Your GitHub repo keeps old versions in its history; its current files shrink with the next push.' }
+    } catch { Write-Warn "$_" }
+    Wait-Key
 }
 
 function Install-PluginNow($config, $name) {
@@ -269,6 +369,9 @@ function Show-SettingsMenu {
             "Import claude.ai / Desktop chat export...`timport",
             "Re-sort everything ${dim}(keeps what you sorted by hand)$reset`tresort",
             "Edit project rules ${dim}(.ccm\projects.json: folders + keywords per project)$reset`trules",
+            "Summaries                      $(if ($config.Summaries -eq 'auto') { "$green[auto]$reset" } else { "$dim[manual]$reset" })  ${dim}'where we left off' notes, model $($config.SummaryModel)$reset`tsummaries",
+            "Write summaries for all projects now`tsummarize-all",
+            "Clean up projects...  ${dim}(pick projects, then archive old/tiny sessions or shrink them)$reset`tcleanup",
             "Plugins ${dim}(add Codex and other agents' context)$reset`tplugins",
             "Run setup again`tsetup"
         )
@@ -308,6 +411,20 @@ function Show-SettingsMenu {
                 Write-Info 'Save the file, then use Re-sort everything to apply the new rules.'; Start-Sleep 2
             }
             'plugins' { Show-PluginsMenu }
+            'summaries' {
+                $config.Summaries = if ($config.Summaries -eq 'auto') { 'manual' } else { 'auto' }
+                $model = Read-Value 'Model for summaries (haiku, sonnet, opus or a full model id)' $config.SummaryModel
+                if ($model) { $config.SummaryModel = $model }
+                Save-Config $config
+            }
+            'summarize-all' {
+                foreach ($p in (Get-ProjectStats $config).Keys | Where-Object { $_ -notin $Unsorted, $Global }) {
+                    Write-Info "Summarizing $p..."
+                    try { Update-ProjectSummary $config $p; Write-Ok "  done" } catch { Write-Warn "  $_" }
+                }
+                Wait-Key
+            }
+            'cleanup' { Invoke-CleanupWizard $config (Select-Projects $config 'Clean up which projects?') }
             'setup' { Invoke-Setup }
         }
     }
@@ -320,7 +437,7 @@ function Show-MainMenu {
         $stats = Get-ProjectStats $config
         $rows = @("$green↻ Sync now$reset`t+sync")
         if ($config.Repo) { $rows += "$green↑ Push to GitHub$reset $dim$($config.Repo)$reset`t+push" }
-        $rows += "$green+ New project$reset`t+new", "$green⧉ Plugins$reset`t+plugins", "$green≡ Settings$reset`t+settings"
+        $rows += "$green/ Search$reset`t+search", "$green+ New project$reset`t+new", "$green⧉ Plugins$reset`t+plugins", "$green≡ Settings$reset`t+settings"
         # most recently active first, Unsorted and _Global last
         $names = $stats.Keys | Sort-Object @{ e = { $_ -in $Unsorted, $Global } }, @{ e = { $stats[$_].Last }; Descending = $true }
         foreach ($name in $names) {
@@ -330,8 +447,8 @@ function Show-MainMenu {
             $pad = ' ' * [Math]::Max(1, 26 - $name.Length)
             $rows += "$label$pad$dim{0,3} sess {1,2} mem  {2}$reset`t{3}`t{4}" -f $s.Sessions, $s.Memory, $last, $name, (Join-Path $config.ContextDir "$(Get-SafeName $name)\PROJECT.md")
         }
-        $header = "Enter open  ·  Ctrl+S sync  ·  Ctrl+N new project  ·  Esc quit`nCtrl+R rename/merge  ·  Ctrl+Y copy context  ·  Ctrl+O folder"
-        $pick = Show-Menu $rows 'Claude Context' $header -Expect 'ctrl-s', 'ctrl-n', 'ctrl-r', 'ctrl-y', 'ctrl-o' -Preview
+        $header = "Enter open  ·  Ctrl+S sync  ·  Ctrl+F search  ·  Ctrl+N new project  ·  Esc quit`nCtrl+R rename/merge  ·  Ctrl+Y copy context  ·  Ctrl+W write summary  ·  Ctrl+K clean up  ·  Ctrl+O folder"
+        $pick = Show-Menu $rows 'Claude Context' $header -Expect 'ctrl-s', 'ctrl-n', 'ctrl-r', 'ctrl-y', 'ctrl-o', 'ctrl-f', 'ctrl-w', 'ctrl-k' -Preview
         if (-not $pick) { Clear-Host; return }
         $row = $pick.Row
         $isProject = $row -and -not $row.StartsWith('+')
@@ -340,6 +457,9 @@ function Show-MainMenu {
             'ctrl-n' { $row = '+new' }
             'ctrl-o' { Start-Process explorer.exe $(if ($isProject) { Join-Path $config.ContextDir (Get-SafeName $row) } else { $config.ContextDir }); continue }
             'ctrl-y' { if ($isProject) { Copy-ProjectContext $config $row }; continue }
+            'ctrl-f' { Show-Search $config $(if ($isProject) { $row } else { '' }); continue }
+            'ctrl-w' { if ($isProject) { Write-SummaryNow $config $row }; continue }
+            'ctrl-k' { Invoke-CleanupWizard $config $(if ($isProject) { @($row) } else { Select-Projects $config 'Clean up which projects?' }); continue }
             'ctrl-r' {
                 if (-not $isProject) { continue }
                 Clear-Host
@@ -356,6 +476,7 @@ function Show-MainMenu {
             '+new' { $n = New-ProjectPrompt $config; if ($n) { Show-ProjectMenu $config $n } }
             '+settings' { Show-SettingsMenu }
             '+plugins' { Show-PluginsMenu }
+            '+search' { Show-Search $config }
             default { Show-ProjectMenu $config $row }
         }
     }
@@ -391,6 +512,21 @@ switch ($Command) {
     }
     'open' { Start-Process explorer.exe (Get-Config).ContextDir }
     'plugins' { Show-PluginsMenu }
+    'search' { Show-Search (Get-Config) (Get-FlagValue $flags 'project') ($params -join ' ') }
+    'summary' {
+        $config = Get-Config
+        $targets = if ('--all' -in $flags) { @((Get-ProjectStats $config).Keys | Where-Object { $_ -notin $Unsorted, $Global }) } else { @($params -join ' ') | Where-Object { $_ } }
+        if (-not $targets) { Write-Warn 'Usage: ClaudeContextManager summary <project>   (or --all)'; exit 1 }
+        foreach ($p in $targets) {
+            Write-Info "Summarizing $p..."
+            try { Update-ProjectSummary $config $p; Write-Ok "Updated $p\SUMMARY.md" } catch { Write-Warn "$_" }
+        }
+    }
+    'cleanup' {
+        $config = Get-Config
+        $targets = if ($params) { @($params) } else { Select-Projects $config 'Clean up which projects?' }
+        Invoke-CleanupWizard $config $targets
+    }
     'plugin' {
         $config = Get-Config
         $action = if ($params.Count) { $params[0] } else { 'list' }
@@ -421,7 +557,7 @@ switch ($Command) {
     'uninstall' { Uninstall-Ccm }
     default {
         if ($PluginCommands.Contains($Command)) { & $PluginCommands[$Command].Action $params $flags; break }
-        Get-Content $PSCommandPath | Select-Object -Skip 2 -First 11 | ForEach-Object { $_.TrimStart('#') }
+        Get-Content $PSCommandPath | Select-Object -Skip 2 -First 14 | ForEach-Object { $_.TrimStart('#') }
         foreach ($c in $PluginCommands.Values) { Write-Host "   $($c.Usage)" }
     }
 }

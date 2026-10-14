@@ -25,6 +25,10 @@ if (-not (Get-Command fzf -ErrorAction SilentlyContinue) -and
     Write-Host '  Installing fzf (the menu UI)...'
     winget install --id junegunn.fzf -e --accept-source-agreements --accept-package-agreements | Out-Null
 }
+if (-not (Get-Command rg -ErrorAction SilentlyContinue)) {
+    Write-Host '  Installing ripgrep (fast search)...'
+    winget install --id BurntSushi.ripgrep.MSVC -e --accept-source-agreements --accept-package-agreements | Out-Null
+}
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Write-Host '  Git is not installed; GitHub backup needs it (winget install Git.Git).' }
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { Write-Host '  GitHub CLI is not installed; GitHub backup needs it (winget install GitHub.cli).' }
 

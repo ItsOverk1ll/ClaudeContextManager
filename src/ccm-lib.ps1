@@ -23,7 +23,7 @@ $script:ClaudeDir = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else 
 $script:DesktopDir = Join-Path $env:APPDATA 'Claude'
 $script:Unsorted = 'Unsorted'
 $script:Global = '_Global'
-$script:CcmVersion = '1.2.0'
+$script:CcmVersion = '1.3.0'
 $script:PluginDir = Join-Path (Split-Path $ConfigFile -Parent) 'plugins'
 $script:ContextSources = [ordered]@{}
 
@@ -85,6 +85,9 @@ function Get-DefaultConfig {
         MinScore    = 4
         PluginRepo  = 'ItsOverk1ll/ClaudeContextManager'
         PluginBranch = 'Plugins'
+        Summaries   = 'manual'     # 'auto': refresh "where we left off" summaries after syncs
+        SummaryModel = 'haiku'
+        SummaryMinHours = 2
         # Folders Claude Code gets launched from for any kind of task: a session's cwd here says nothing about its project
         GenericDirs = @($HOME, (Join-Path $HOME 'Claude'), (Join-Path $HOME '.local\bin'), [Environment]::GetFolderPath('Desktop'))
     }
@@ -450,7 +453,7 @@ function Format-Session($s, $project, $config) {
         $when = if ($t.Time) { " · $($t.Time.ToString('MM-dd HH:mm'))" } else { '' }
         [void]$sb.AppendLine("## $who$when").AppendLine()
         if ($t.Text.Count) { [void]$sb.AppendLine(($t.Text -join "`n`n")).AppendLine() }
-        if ($t.Tools.Count) { [void]$sb.AppendLine(($t.Tools -join "`n")).AppendLine() }
+        if ($t.Tools.Count -and -not ($s.PSObject.Properties['Compact'] -and $s.Compact)) { [void]$sb.AppendLine(($t.Tools -join "`n")).AppendLine() }
     }
     $out = $sb.ToString()
     if ($config.Redact) { $out = Protect-Secrets $out }
@@ -528,6 +531,18 @@ function Write-ProjectIndex($project, $index, $projects, $config) {
     if ($rule -and @($rule.keywords).Count) { [void]$sb.AppendLine("**Keywords:** $(@($rule.keywords) -join ', ')  ") }
     $last = if ($sessions) { $sessions[0].updated } else { '-' }
     [void]$sb.AppendLine("**Sessions:** $($sessions.Count) · **Memory files:** $($memory.Count) · **Last activity:** $last").AppendLine()
+    $summaryFile = Join-Path $dir 'SUMMARY.md'
+    if (Test-Path -LiteralPath $summaryFile) {
+        # the summary's own title line is replaced by this section heading
+        $sum = (Get-Content -LiteralPath $summaryFile -Raw) -replace '^# .*\r?\n', '' -replace '(?m)^## ', '### '
+        [void]$sb.AppendLine('## Where we left off').AppendLine().AppendLine($sum.Trim()).AppendLine()
+    }
+    $gitState = Read-State $config 'git'
+    if ($gitState.Contains($project) -and @($gitState[$project].commits).Count) {
+        [void]$sb.AppendLine('## Recent commits').AppendLine()
+        foreach ($c in @($gitState[$project].commits) | Select-Object -First 5) { [void]$sb.AppendLine("- $($c.t) ``$($c.h)`` $($c.s)") }
+        [void]$sb.AppendLine().AppendLine('[All git activity](GIT.md)').AppendLine()
+    }
     $docs = @(Get-ProjectDocs $dir)
     if ($docs) {
         [void]$sb.AppendLine('## Project docs').AppendLine()
@@ -543,11 +558,13 @@ function Write-ProjectIndex($project, $index, $projects, $config) {
     foreach ($group in $sessions | Group-Object { Get-AgentLabel $_ } | Sort-Object { $_.Name -ne 'Claude' }, Name) {
         $heading = if ($group.Name -eq 'Claude') { 'Sessions' } else { "$($group.Name) sessions" }
         [void]$sb.AppendLine("## $heading").AppendLine()
-        [void]$sb.AppendLine('| Updated | Title | Source | Prompts |').AppendLine('|---|---|---|---|')
+        [void]$sb.AppendLine('| Updated | Title | Source | Prompts | Commits |').AppendLine('|---|---|---|---|---|')
         foreach ($x in $group.Group) {
             # links are relative to PROJECT.md, which sits in the project folder
             $link = ($x.file.Substring($x.file.IndexOf('\') + 1)) -replace '\\', '/'
-            [void]$sb.AppendLine("| $($x.updated) | [$($x.title -replace '\|', '/')]($link) | $($x.source) | $($x.prompts) |")
+            $made = @(Get-SessionCommits $gitState $project $x)
+            $commitCell = if ($made.Count) { "$($made.Count): " + (($made | Select-Object -First 3 | ForEach-Object { '`' + $_.h + '`' }) -join ' ') } else { '' }
+            [void]$sb.AppendLine("| $($x.updated) | [$($x.title -replace '\|', '/')]($link) | $($x.source) | $($x.prompts) | $commitCell |")
         }
         [void]$sb.AppendLine()
     }
@@ -574,8 +591,8 @@ function Write-ContextReadme($index, $config) {
 
 #region Sync
 
-function New-IndexEntry($item, $project, $rel, $source, [bool]$auto, [string]$agent = 'claude') {
-    [ordered]@{ kind = $item.Kind; agent = $agent; project = $project; auto = $auto; file = $rel; title = $item.Title; source = $item.Source
+function New-IndexEntry($item, $project, $rel, $source, [bool]$auto, [string]$agent = 'claude', [bool]$compact = $false) {
+    [ordered]@{ kind = $item.Kind; agent = $agent; project = $project; auto = $auto; compact = $compact; file = $rel; title = $item.Title; source = $item.Source
         cwd = $item.Cwd; started = $item.Started.ToString('yyyy-MM-dd HH:mm'); updated = $item.Updated.ToString('yyyy-MM-dd HH:mm')
         prompts = $item.Prompts; sourcePath = $item.SourcePath; mtime = $source.Mtime; size = $source.Size }
 }
@@ -597,11 +614,13 @@ function Save-ContextItem($item, $source, $index, $overrides, $projects, $config
     elseif ($old -and -not $config.AutoSort -and -not $Resort) { $project = $old.project; $auto = [bool]$old.auto }
     elseif ($config.AutoSort -or $Resort) { $project = Get-AutoProject $item $projects $config }
     else { $project = $Unsorted }
+    $compact = [bool]($old -and $old.compact)      # cleaned up earlier: keep it without tool lines
+    if ($compact) { $item | Add-Member -NotePropertyName Compact -NotePropertyValue $true -Force }
     $rel = Write-ContextItem $item $project $config
     if ($old -and $old.file -and $old.file -ne $rel) {
         Remove-Item -LiteralPath (Join-Path $config.ContextDir $old.file) -ErrorAction SilentlyContinue
     }
-    $index[$item.Id] = New-IndexEntry $item $project $rel $source $auto $Agent
+    $index[$item.Id] = New-IndexEntry $item $project $rel $source $auto $Agent $compact
     @($project, $old.project) | Where-Object { $_ }
 }
 
@@ -656,15 +675,18 @@ function Invoke-Sync($config, [switch]$Quiet, [switch]$Resort, [switch]$Push) {
         }
         Write-State $config 'index' $index
         Write-State $config 'projects' $projects
+        try { foreach ($p in (Update-GitActivity $config $index $projects -Force:$Resort)) { [void]$touched.Add($p) } }
+        catch { if (-not $Quiet) { Write-Warn "Git activity: $_" } }
         foreach ($p in $touched) { Write-ProjectIndex $p $index $projects $config }
         Remove-EmptyProjects $config
         Write-ContextReadme $index $config
-        $count
+        @{ Count = $count; Touched = @($touched) }
     }
     if ($null -eq $result) { if (-not $Quiet) { Write-Warn 'Another sync is already running.' }; return 0 }
-    if (-not $Quiet) { Write-Ok "Synced: $result new or updated item(s)." }
+    if (-not $Quiet) { Write-Ok "Synced: $($result.Count) new or updated item(s)." }
+    Update-Summaries $config $result.Touched -Quiet:$Quiet
     if (($Push -or $config.AutoPush) -and $config.Repo) { Push-Context $config -Quiet:$Quiet }
-    $result
+    $result.Count
 }
 
 function Remove-EmptyProjects($config) {
@@ -1172,7 +1194,7 @@ function Get-TranscriptDigest([string]$file, [int]$maxChars = 3000) {
 # One agent's (or several agents') context for a project as text: their docs, memory, a list of their
 # sessions and digests of the most recent ones. Agents never see each other's context unless asked:
 # Ctrl+Y copies only Claude's; the OliveBranch plugin is the opt-in bridge.
-function Get-AgentContext($config, [string]$project, [string[]]$Agents, [int]$RecentSessions = 3, [int]$MaxChars = 40000) {
+function Get-AgentContext($config, [string]$project, [string[]]$Agents, [int]$RecentSessions = 3, [int]$MaxChars = 40000, [string[]]$Exclude = @()) {
     $dir = Join-Path $config.ContextDir (Get-SafeName $project)
     $index = Read-State $config 'index'
     $pluginFolders = @($ContextSources.Values | Where-Object { $_.Folder } | ForEach-Object { $_.Folder })
@@ -1184,11 +1206,15 @@ function Get-AgentContext($config, [string]$project, [string[]]$Agents, [int]$Re
         $entries = @($index.Values | Where-Object { $_.project -eq $project -and ($(if ($_.agent) { $_.agent } else { 'claude' }) -eq $agent) })
         $docs = @(Get-ProjectDocs $dir | Where-Object {
             $top = ($_.RelPath -split '\\')[0]
-            if ($folder) { $_.RelPath -like "$folder\*" } else { -not ($_.RelPath.Contains('\') -and $top -in $pluginFolders) }
-        })
+            $_.RelPath -notin $Exclude -and $(if ($folder) { $_.RelPath -like "$folder\*" } else { -not ($_.RelPath.Contains('\') -and $top -in $pluginFolders) })
+        } | Sort-Object { $_.Name -ne 'SUMMARY.md' }, { $_.Name -eq 'GIT.md' })
         if (-not $entries -and -not $docs) { continue }
         [void]$sb.AppendLine("# $label context for project $project").AppendLine()
-        foreach ($d in $docs) { [void]$sb.AppendLine("## $label doc: $($d.RelPath)").AppendLine().AppendLine((Get-Content -LiteralPath $d.FullName -Raw)).AppendLine() }
+        foreach ($d in $docs) {
+            $t = Get-Content -LiteralPath $d.FullName -Raw
+            if ($t.Length -gt 8000) { $t = $t.Substring(0, 8000) + "`n… (truncated, full file: $($d.FullName))" }
+            [void]$sb.AppendLine("## $label doc: $($d.RelPath)").AppendLine().AppendLine($t).AppendLine()
+        }
         foreach ($m in $entries | Where-Object kind -eq 'memory') {
             [void]$sb.AppendLine("## $label memory: $($m.title)").AppendLine().AppendLine((Get-Content -LiteralPath (Join-Path $config.ContextDir $m.file) -Raw)).AppendLine()
         }
@@ -1208,6 +1234,8 @@ function Get-AgentContext($config, [string]$project, [string[]]$Agents, [int]$Re
     if ($text.Length -gt $MaxChars) { $text = $text.Substring(0, $MaxChars) + "`n… (truncated; open the session files listed above for more)" }
     $text
 }
+
+. (Join-Path $PSScriptRoot 'ccm-features.ps1')
 
 # Load installed plugins (dot-sourced here so their functions and Register-ContextSource calls take effect)
 foreach ($pluginScript in @(Get-ChildItem $PluginDir -Directory -ErrorAction SilentlyContinue | ForEach-Object { Join-Path $_.FullName 'plugin.ps1' } | Where-Object { Test-Path $_ })) {
