@@ -70,6 +70,9 @@ function Get-SessionCommits($gitState, [string]$project, $entry) {
 
 $script:SummarizerDir = Join-Path (Split-Path $ConfigFile -Parent) 'summarizer'
 
+# Replaces Claude Code's default system prompt (~3k tokens of tool and coding instructions a summary never uses) with a short one
+$script:SummarySystemPrompt = 'You write concise, accurate project hand-off notes from the material you are given. Output only the requested Markdown.'
+
 # Runs `claude -p` with no tools, no saved session, no user settings (so no hooks fire) and no MCP servers,
 # from an empty folder, so a summary never shows up as a session of its own.
 function Invoke-ClaudeHeadless([string]$prompt, [string]$stdin, [string]$model, [int]$timeoutSec = 240) {
@@ -77,7 +80,7 @@ function Invoke-ClaudeHeadless([string]$prompt, [string]$stdin, [string]$model, 
     if (-not $claude) { throw 'The claude command was not found.' }
     New-Item -ItemType Directory -Force $SummarizerDir | Out-Null
     $psi = [Diagnostics.ProcessStartInfo]::new($claude.Source)
-    foreach ($a in '-p', '--no-session-persistence', '--tools', '', '--setting-sources', 'local', '--strict-mcp-config', '--model', $model, $prompt) { $psi.ArgumentList.Add($a) }
+    foreach ($a in '-p', '--no-session-persistence', '--tools', '', '--setting-sources', 'local', '--strict-mcp-config', '--disable-slash-commands', '--exclude-dynamic-system-prompt-sections', '--system-prompt', $SummarySystemPrompt, '--model', $model, $prompt) { $psi.ArgumentList.Add($a) }
     $psi.WorkingDirectory = $SummarizerDir
     $psi.RedirectStandardInput = $psi.RedirectStandardOutput = $psi.RedirectStandardError = $true
     $psi.UseShellExecute = $false
@@ -96,26 +99,51 @@ function Invoke-ClaudeHeadless([string]$prompt, [string]$stdin, [string]$model, 
     $out.Result.Trim()
 }
 
-function Update-ProjectSummary($config, [string]$project) {
+# Full rebuild every Nth update so incremental edits can't drift from the source material
+$script:SummaryFullEvery = 5
+
+function Update-ProjectSummary($config, [string]$project, [switch]$Full) {
     $dir = Join-Path $config.ContextDir (Get-SafeName $project)
-    $context = Get-AgentContext $config $project @('claude') -RecentSessions 6 -MaxChars 60000 -Exclude 'SUMMARY.md'
+    $summaryFile = Join-Path $dir 'SUMMARY.md'
+    $state = Read-State $config 'summaries'
+    $prev = $state[$project]
+    $prevText = if (Test-Path -LiteralPath $summaryFile) { Get-Content -LiteralPath $summaryFile -Raw } else { '' }
+    $incremental = -not $Full -and $prev -and $prev.latestSession -and $prev.hashes -and $prevText -and ([int]$prev.incremental + 1) -lt $SummaryFullEvery
+    $seen = @{}
+    $known = if ($incremental) { $prev.hashes } else { $null }
+    $since = if ($incremental) { [string]$prev.latestSession } else { '' }
+    $context = Get-AgentContext $config $project @('claude') -RecentSessions 6 -MaxChars 60000 -Exclude 'SUMMARY.md' -SinceUpdated $since -KnownHashes $known -SeenHashes $seen
     if (-not $context.Trim()) { throw "No Claude context in $project to summarize." }
-    $prompt = "On stdin is everything the user's Claude sessions recorded about the project `"$project`" (instruction files, memory, git activity, a list of sessions and digests of the latest ones). " +
-        "Write a short 'where we left off' note so the next session can pick up quickly. Markdown, these sections only: " +
-        "'## Where we left off' (2-4 sentences on the latest state), '## Open threads' (bullets: unfinished work, open questions, anything waiting on the user), " +
-        "'## Next steps' (bullets), '## Key facts' (bullets: decisions, gotchas, paths and commands worth remembering). " +
-        "Be specific and use names and paths from the context; only state what it supports; newest information wins over older. No preamble."
+    # nothing the summary is built from has changed since it was written: no call at all
+    $sessionStamps = @((Read-State $config 'index').Values | Where-Object { $_.project -eq $project -and $_.kind -ne 'memory' -and (-not $_.agent -or $_.agent -eq 'claude') } | ForEach-Object { "$($_.file)@$($_.updated)" } | Sort-Object) -join ';'
+    $fingerprint = Get-TextHash ($sessionStamps + '|' + (($seen.GetEnumerator() | Sort-Object Key | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ';'))
+    if (-not $Full -and $prev -and $prev.inputHash -eq $fingerprint -and $prevText) { return $false }
+    $sections = "'## Where we left off' (2-4 sentences on the latest state), '## Open threads' (bullets: unfinished work, open questions, anything waiting on the user), " +
+        "'## Next steps' (bullets), '## Key facts' (bullets: decisions, gotchas, paths and commands worth remembering)"
+    if ($incremental) {
+        $old = $prevText -replace '(?s)^# Where we left off[^\n]*\r?\n\s*_Written by[^\n]*\r?\n\s*', ''
+        $prompt = "Below, after the line ===PREVIOUS NOTE===, is the 'where we left off' note for the project `"$project`" as last written; on stdin is only what is NEW or CHANGED since (changed docs and memory, the session list, digests of sessions updated since). " +
+            "Rewrite the note so it is current: Markdown, these sections only: $sections. " +
+            "Keep every still-valid fact, path and command from the previous note (do not drop details just because the new material doesn't repeat them), update anything the new material changes, remove what it makes obsolete or completed; newest information wins. Only state what the note or the new material supports. No preamble.`n===PREVIOUS NOTE===`n$old"
+    } else {
+        $prompt = "On stdin is everything the user's Claude sessions recorded about the project `"$project`" (instruction files, memory, git activity, a list of sessions and digests of the latest ones). " +
+            "Write a short 'where we left off' note so the next session can pick up quickly. Markdown, these sections only: $sections. " +
+            "Be specific and use names and paths from the context; only state what it supports; newest information wins over older. No preamble."
+    }
     $summary = Invoke-ClaudeHeadless $prompt $context $config.SummaryModel
     if ($config.Redact) { $summary = Protect-Secrets $summary }
     $index = Read-State $config 'index'
     $claudeSessions = @($index.Values | Where-Object { $_.project -eq $project -and $_.kind -ne 'memory' -and (-not $_.agent -or $_.agent -eq 'claude') })
     $latest = @($claudeSessions.updated | Sort-Object)[-1]
     $text = "# Where we left off: $project`n`n_Written by Claude ($($config.SummaryModel)) from $($claudeSessions.Count) session(s), latest $latest. Updated $((Get-Date).ToString('yyyy-MM-dd HH:mm'))._`n`n$summary`n"
-    Set-Content -LiteralPath (Join-Path $dir 'SUMMARY.md') -Value $text -Encoding utf8NoBOM -NoNewline
-    $state = Read-State $config 'summaries'
-    $state[$project] = [ordered]@{ written = (Get-Date).ToString('yyyy-MM-dd HH:mm'); latestSession = $latest }
+    Set-Content -LiteralPath $summaryFile -Value $text -Encoding utf8NoBOM -NoNewline
+    # hashes of every doc/memory file as of now (an incremental run only saw the changed ones, so take a fresh full set)
+    $allSeen = @{}
+    Get-AgentContext $config $project @('claude') -RecentSessions 0 -MaxChars 1 -Exclude 'SUMMARY.md' -SeenHashes $allSeen | Out-Null
+    $state[$project] = [ordered]@{ written = (Get-Date).ToString('yyyy-MM-dd HH:mm'); latestSession = $latest; hashes = $allSeen; inputHash = $fingerprint; incremental = $(if ($incremental) { [int]$prev.incremental + 1 } else { 0 }) }
     Write-State $config 'summaries' $state
     Invoke-WithLock $config { Write-ProjectIndex $project (Read-State $config 'index') (Read-State $config 'projects') $config } -WaitSeconds 60 | Out-Null
+    $true
 }
 
 # After a sync: refresh summaries of projects with new Claude sessions (if Summaries = auto), at most every
@@ -132,7 +160,7 @@ function Update-Summaries($config, [string[]]$projects, [switch]$Quiet) {
             if ($s.latestSession -ge $latest) { continue }
             if (((Get-Date) - [datetime]::ParseExact($s.written, 'yyyy-MM-dd HH:mm', $null)).TotalHours -lt $config.SummaryMinHours) { continue }
         }
-        try { Update-ProjectSummary $config $p; if (-not $Quiet) { Write-Ok "Summary updated: $p" } }
+        try { if (Update-ProjectSummary $config $p) { if (-not $Quiet) { Write-Ok "Summary updated: $p" } } }
         catch { if (-not $Quiet) { Write-Warn "Summary for ${p}: $_" } }
     }
 }

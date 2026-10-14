@@ -24,7 +24,7 @@ $script:DesktopDir = Join-Path $env:APPDATA 'Claude'
 $script:Unsorted = 'Unsorted'
 $script:Global = '_Global'
 $script:MemoryRoot = '_Memory'      # memory files live here by agent, not inside projects
-$script:CcmVersion = '1.4.0'
+$script:CcmVersion = '1.4.1'
 $script:PluginDir = Join-Path (Split-Path $ConfigFile -Parent) 'plugins'
 $script:ContextSources = [ordered]@{}
 
@@ -1277,6 +1277,8 @@ function Find-ProjectForPath($config, [string]$path) {
 }
 
 # The last "## Claude"/"## Codex" reply and every "## You" prompt from a saved transcript
+function Get-TextHash([string]$text) { [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($text))) }
+
 function Get-TranscriptDigest([string]$file, [int]$maxChars = 3000) {
     $raw = Get-Content -LiteralPath $file -Raw
     $body = $raw -replace '(?s)^---.*?---\s*', ''
@@ -1298,7 +1300,7 @@ function Get-TranscriptDigest([string]$file, [int]$maxChars = 3000) {
 # One agent's (or several agents') context for a project as text: their docs, memory, a list of their
 # sessions and digests of the most recent ones. Agents never see each other's context unless asked:
 # Ctrl+Y copies only Claude's; the OliveBranch plugin is the opt-in bridge.
-function Get-AgentContext($config, [string]$project, [string[]]$Agents, [int]$RecentSessions = 3, [int]$MaxChars = 40000, [string[]]$Exclude = @()) {
+function Get-AgentContext($config, [string]$project, [string[]]$Agents, [int]$RecentSessions = 3, [int]$MaxChars = 40000, [string[]]$Exclude = @(), [string]$SinceUpdated = '', [hashtable]$KnownHashes = $null, [hashtable]$SeenHashes = $null) {
     $dir = Join-Path $config.ContextDir (Get-SafeName $project)
     $index = Read-State $config 'index'
     $pluginFolders = @($ContextSources.Values | Where-Object { $_.Folder } | ForEach-Object { $_.Folder })
@@ -1316,19 +1318,29 @@ function Get-AgentContext($config, [string]$project, [string[]]$Agents, [int]$Re
         [void]$sb.AppendLine("# $label context for project $project").AppendLine()
         foreach ($d in $docs) {
             $t = Get-Content -LiteralPath $d.FullName -Raw
+            if ($SeenHashes -ne $null) {
+                $h = Get-TextHash $t; $SeenHashes[$d.RelPath] = $h
+                if ($KnownHashes -ne $null -and $KnownHashes[$d.RelPath] -eq $h) { continue }
+            }
             if ($t.Length -gt 8000) { $t = $t.Substring(0, 8000) + "`n… (truncated, full file: $($d.FullName))" }
             [void]$sb.AppendLine("## $label doc: $($d.RelPath)").AppendLine().AppendLine($t).AppendLine()
         }
         foreach ($m in $entries | Where-Object kind -eq 'memory') {
             $mf = Join-Path $config.ContextDir $m.file
-            if (Test-Path -LiteralPath $mf) { [void]$sb.AppendLine("## $label memory: $($m.title)").AppendLine().AppendLine((Get-Content -LiteralPath $mf -Raw)).AppendLine() }
+            if (-not (Test-Path -LiteralPath $mf)) { continue }
+            $mt = Get-Content -LiteralPath $mf -Raw
+            if ($SeenHashes -ne $null) {
+                $h = Get-TextHash $mt; $SeenHashes["memory:$($m.file)"] = $h
+                if ($KnownHashes -ne $null -and $KnownHashes["memory:$($m.file)"] -eq $h) { continue }
+            }
+            [void]$sb.AppendLine("## $label memory: $($m.title)").AppendLine().AppendLine($mt).AppendLine()
         }
         $sessions = @($entries | Where-Object kind -ne 'memory' | Sort-Object { $_.updated } -Descending)
         if ($sessions) {
             [void]$sb.AppendLine("## $label sessions ($($sessions.Count))").AppendLine()
             foreach ($x in $sessions) { [void]$sb.AppendLine("- $($x.updated) · $($x.title) · $(Join-Path $config.ContextDir $x.file)") }
             [void]$sb.AppendLine()
-            foreach ($x in $sessions | Select-Object -First $RecentSessions) {
+            foreach ($x in $sessions | Select-Object -First $RecentSessions | Where-Object { -not $SinceUpdated -or $_.updated -gt $SinceUpdated }) {
                 $f = Join-Path $config.ContextDir $x.file
                 if (-not (Test-Path -LiteralPath $f)) { continue }
                 [void]$sb.AppendLine("## Recent $label session: $($x.title) ($($x.updated))").AppendLine().AppendLine((Get-TranscriptDigest $f)).AppendLine()
