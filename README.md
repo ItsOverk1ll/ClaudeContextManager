@@ -5,6 +5,7 @@ Plugins add context from other AI agents to your Context folder. Find the one yo
 | Plugin | What it adds | Install |
 |---|---|---|
 | [codex](plugins/codex/README.md) | OpenAI Codex CLI sessions + AGENTS.md files, sorted into your projects in a separate `codex` folder | `ClaudeContextManager plugin install codex` |
+| [olivebranch](plugins/olivebranch/README.md) | Opt-in bridge: Claude can read your Codex context and vice versa, when you ask in a session or always on for projects you choose | `ClaudeContextManager plugin install olivebranch` |
 
 You can also browse and install plugins from the menu: **ClaudeContextManager → ⧉ Plugins** (or run `ClaudeContextManager plugins`).
 
@@ -15,7 +16,7 @@ You can also browse and install plugins from the menu: **ClaudeContextManager �
 | `ClaudeContextManager plugin remove <name>` | remove a plugin (asks whether to keep its context) |
 | `ClaudeContextManager plugin list` | show installed and available plugins |
 
-Needs ClaudeContextManager 1.1.0 or newer. Plugins install to `%APPDATA%\ClaudeContextManager\plugins\<name>`.
+Needs ClaudeContextManager 1.1.0 or newer (OliveBranch: 1.2.0). Plugins install to `%APPDATA%\ClaudeContextManager\plugins\<name>`.
 
 ---
 
@@ -45,6 +46,8 @@ Register-ContextSource @{
 ```
 
 An item is a `[pscustomobject]` with: `Id, Kind ('session'), SourcePath, Title, Cwd, Branch, Source` (label in tables), `Started, Updated` (DateTime), `Turns` (list of `@{ Role = 'user'|'assistant'; Time; Text = List[string]; Tools = List[string] }`), `Hits` (paths for sorting, add with `Add-PathHit $hits $path $weight`: 4 for the working folder, 3 for edited files, 1 for reads/commands), `UserText` (your prompts, for keyword matching), `Prompts` (count). Optional: `AssistantName` (transcript heading), `ResumeHint` (shown in the transcript).
+
+Plugins can also add commands (`Register-CcmCommand -Name -Usage -Action { param($params, $flags) }`), entries in a project's Ctrl+P menu (`Register-ProjectAction -Label {..} -Run {..}`) and install/uninstall steps (`Register-PluginLifecycle -Name -OnInstall {..} -OnUninstall {..}`). `Get-AgentContext $config $project @('codex')` returns one agent's context for a project as text; see [olivebranch](plugins/olivebranch/plugin.ps1).
 
 Sources are only re-read when `Mtime`/`Size` change, so syncing stays fast. Helpers available to plugins: `Add-PathHit`, `$PathRegex`, `ConvertTo-DateTime`, `Get-OneLine`, `Get-SafeName`, `Protect-Secrets`, `$Global` (the `_Global` folder name). See [plugins/codex/plugin.ps1](plugins/codex/plugin.ps1) for a complete example.
 

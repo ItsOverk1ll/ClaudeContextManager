@@ -1,0 +1,7 @@
+{
+  "name": "olivebranch",
+  "version": "1.0.0",
+  "description": "Opt-in bridge: let Claude read your Codex context (and vice versa), per session or always on for a project",
+  "author": "ItsOverk1ll",
+  "minCcmVersion": "1.2.0"
+}
