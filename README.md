@@ -43,7 +43,10 @@ Plugins add context from other AI agents, sorted into the same projects but kept
 
 ```powershell
 ClaudeContextManager plugin install codex     # OpenAI Codex CLI sessions + AGENTS.md
+ClaudeContextManager plugin install olivebranch   # opt-in: let Claude read Codex context and vice versa
 ```
+
+Each agent's context stays separate: Ctrl+Y copies only Claude's, and agents never get each other's context unless you install OliveBranch and ask (per session) or turn it on for a project.
 
 `plugin list`, `plugin update` and `plugin remove <name>` manage them. The Plugins branch README explains how to write one.
 

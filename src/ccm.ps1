@@ -130,19 +130,21 @@ function New-ProjectPrompt($config) {
 }
 
 function Copy-ProjectContext($config, $project) {
-    $dir = Join-Path $config.ContextDir (Get-SafeName $project)
-    $parts = @()
-    $pm = Join-Path $dir 'PROJECT.md'
-    if (Test-Path -LiteralPath $pm) { $parts += "<!-- PROJECT.md -->`n$(Get-Content -LiteralPath $pm -Raw)" }
-    $memory = Get-ChildItem $dir -Recurse -File -Filter *.md | Where-Object { $_.Directory.Name -eq 'memory' }
-    foreach ($f in @(Get-ProjectDocs $dir) + @($memory)) {
-        $name = if ($f.RelPath) { $f.RelPath } else { "memory\$($f.Name)" }
-        $parts += "<!-- $name -->`n$(Get-Content -LiteralPath $f.FullName -Raw)"
-    }
-    $text = "Context for project ${project} (from my Context folder: $dir)`n`n" + ($parts -join "`n`n")
+    # Claude's context only; other agents' context stays separate (the OliveBranch plugin can bridge it)
+    $text = Get-AgentContext $config $project @('claude') -RecentSessions 3 -MaxChars 200000
+    if (-not $text.Trim()) { Write-Warn "No Claude context in $project yet."; Start-Sleep 1; return }
     Set-Clipboard -Value $text
-    Write-Ok "Copied $($text.Length) characters of $project context (PROJECT.md, docs and memory). Paste it into Claude."
+    Write-Ok "Copied $($text.Length) characters of $project Claude context (docs, memory, sessions). Paste it into Claude."
     Start-Sleep -Milliseconds 1200
+}
+
+function Show-ProjectActions($config, $project) {
+    if (-not $ProjectActions.Count) { return }
+    $rows = for ($i = 0; $i -lt $ProjectActions.Count; $i++) { "$(& $ProjectActions[$i].Label $config $project)`t$i" }
+    $pick = Show-Menu @($rows) "$project · plugins" 'Enter choose  ·  Esc back'
+    if (-not $pick) { return }
+    Clear-Host
+    & $ProjectActions[[int]$pick.Row].Run $config $project
 }
 
 function Show-ProjectMenu($config, $project) {
@@ -168,10 +170,11 @@ function Show-ProjectMenu($config, $project) {
             $rows += "$dim$($e.updated.Substring(5, 5))$reset$pin{0,-40} $dim{1,-7}{2,3}p$reset`t{3}`t{4}" -f (Get-OneLine $e.title 40), $src, $e.prompts, $s.Key, (Join-Path $config.ContextDir $e.file)
         }
         $header = "Enter open  ·  Ctrl+V move to project  ·  Ctrl+R resume session  ·  Esc back`n" +
-            "Ctrl+Y copy  ·  Ctrl+D remove  ·  Ctrl+O folder  ·  $green•$reset sorted by hand"
-        $pick = Show-Menu $rows $project $header -Expect 'ctrl-v', 'ctrl-r', 'ctrl-y', 'ctrl-d', 'ctrl-o' -Preview
+            "Ctrl+Y copy  ·  Ctrl+D remove  ·  Ctrl+O folder  ·  $(if ($ProjectActions.Count) { 'Ctrl+P plugins  ·  ' })$green•$reset sorted by hand"
+        $pick = Show-Menu $rows $project $header -Expect 'ctrl-v', 'ctrl-r', 'ctrl-y', 'ctrl-d', 'ctrl-o', 'ctrl-p' -Preview
         if (-not $pick) { return }
         if ($pick.Key -eq 'ctrl-o') { Start-Process explorer.exe $dir; continue }
+        if ($pick.Key -eq 'ctrl-p') { Show-ProjectActions $config $project; continue }
         if (-not $pick.Row) { continue }
         $id = $pick.Row
         $path = if ($id -like 'file:*') { Join-Path $dir $id.Substring(5) } else { Join-Path $config.ContextDir $index[$id].file }
@@ -416,5 +419,9 @@ switch ($Command) {
         }
     }
     'uninstall' { Uninstall-Ccm }
-    default { Get-Content $PSCommandPath | Select-Object -Skip 2 -First 11 | ForEach-Object { $_.TrimStart('#') } }
+    default {
+        if ($PluginCommands.Contains($Command)) { & $PluginCommands[$Command].Action $params $flags; break }
+        Get-Content $PSCommandPath | Select-Object -Skip 2 -First 11 | ForEach-Object { $_.TrimStart('#') }
+        foreach ($c in $PluginCommands.Values) { Write-Host "   $($c.Usage)" }
+    }
 }

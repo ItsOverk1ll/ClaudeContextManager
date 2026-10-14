@@ -23,7 +23,7 @@ $script:ClaudeDir = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else 
 $script:DesktopDir = Join-Path $env:APPDATA 'Claude'
 $script:Unsorted = 'Unsorted'
 $script:Global = '_Global'
-$script:CcmVersion = '1.1.0'
+$script:CcmVersion = '1.2.0'
 $script:PluginDir = Join-Path (Split-Path $ConfigFile -Parent) 'plugins'
 $script:ContextSources = [ordered]@{}
 
@@ -40,6 +40,32 @@ function Register-ContextSource([hashtable]$source) {
     if (-not $source.Contains('Label')) { $source.Label = $source.Name }
     if (-not $source.Contains('Folder')) { $source.Folder = '' }
     $script:ContextSources[$source.Name] = $source
+}
+
+# Plugins can also add `ClaudeContextManager <name>` commands, actions in a project's Ctrl+P menu, and
+# install/uninstall steps (run when the plugin is installed or removed).
+$script:PluginCommands = [ordered]@{}
+$script:ProjectActions = [Collections.Generic.List[hashtable]]::new()
+$script:PluginLifecycle = @{}
+
+# Action: { param($params, $flags) }. Flags look like --name or --name=value (see Get-FlagValue).
+function Register-CcmCommand([string]$Name, [string]$Usage, [scriptblock]$Action) {
+    $script:PluginCommands[$Name] = @{ Usage = $Usage; Action = $Action }
+}
+
+# Label: { param($config, $project) -> menu text }; Run: { param($config, $project) }
+function Register-ProjectAction([scriptblock]$Label, [scriptblock]$Run) {
+    $script:ProjectActions.Add(@{ Label = $Label; Run = $Run })
+}
+
+# OnInstall / OnUninstall: { param($config) }
+function Register-PluginLifecycle([string]$Name, [scriptblock]$OnInstall, [scriptblock]$OnUninstall) {
+    $script:PluginLifecycle[$Name] = @{ OnInstall = $OnInstall; OnUninstall = $OnUninstall }
+}
+
+function Get-FlagValue([string[]]$flags, [string]$name) {
+    foreach ($f in $flags) { if ($f -match "^--$name=(.*)$") { return $Matches[1].Trim('"') } }
+    $null
 }
 
 function Get-AgentLabel($entry) {
@@ -1069,6 +1095,10 @@ function Install-CcmPlugin($config, [string]$nameOrPath) {
     if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
     New-Item -ItemType Directory -Force $dest | Out-Null
     Get-ChildItem -LiteralPath $src.Path -Force | Where-Object Name -ne '.git' | Copy-Item -Destination $dest -Recurse -Force
+    # load it now so its install step (skills, hooks...) can run
+    . (Join-Path $dest 'plugin.ps1')
+    $life = $PluginLifecycle[$src.Name]
+    if ($life -and $life.OnInstall) { & $life.OnInstall $config }
     Read-PluginManifest $dest
 }
 
@@ -1076,6 +1106,8 @@ function Install-CcmPlugin($config, [string]$nameOrPath) {
 function Uninstall-CcmPlugin($config, [string]$name, [switch]$RemoveContext) {
     $dir = Join-Path $PluginDir $name
     if (-not (Test-Path $dir)) { throw "Plugin '$name' isn't installed." }
+    $life = $PluginLifecycle[$name]
+    if ($life -and $life.OnUninstall) { & $life.OnUninstall $config }
     Remove-Item $dir -Recurse -Force
     if (-not $RemoveContext) { return }
     Invoke-WithLock $config {
@@ -1098,6 +1130,83 @@ function Uninstall-CcmPlugin($config, [string]$name, [switch]$RemoveContext) {
         Remove-EmptyProjects $config
         Write-ContextReadme $index $config
     } | Out-Null
+}
+
+# Which project does a folder belong to? Uses the project rules first, then the same detection as auto-sort.
+function Find-ProjectForPath($config, [string]$path) {
+    if (-not $path) { return $null }
+    $p = ConvertTo-WindowsPath $path
+    $projects = Read-State $config 'projects'
+    $best = $null; $bestLen = -1
+    foreach ($name in $projects.Keys) {
+        foreach ($root in @($projects[$name].paths)) {
+            if (-not $root) { continue }
+            $r = $root.TrimEnd('\')
+            if (($p -ieq $r -or $p.StartsWith("$r\", [StringComparison]::OrdinalIgnoreCase)) -and $r.Length -gt $bestLen) { $best = $name; $bestLen = $r.Length }
+        }
+    }
+    if ($best) { return $best }
+    $root = Get-ProjectRoot $p $config
+    if ($root) { return (Find-ProjectByPath $projects $root) }
+    $null
+}
+
+# The last "## Claude"/"## Codex" reply and every "## You" prompt from a saved transcript
+function Get-TranscriptDigest([string]$file, [int]$maxChars = 3000) {
+    $raw = Get-Content -LiteralPath $file -Raw
+    $body = $raw -replace '(?s)^---.*?---\s*', ''
+    $sections = [regex]::Split($body, '(?m)^## ') | Select-Object -Skip 1
+    $prompts = @(); $last = ''
+    foreach ($sec in $sections) {
+        $nl = $sec.IndexOf("`n")
+        $head = if ($nl -ge 0) { $sec.Substring(0, $nl) } else { $sec }
+        $text = if ($nl -ge 0) { $sec.Substring($nl + 1).Trim() } else { '' }
+        if ($head -like 'You*') { $prompts += Get-OneLine $text 300 } elseif ($text) { $last = $text }
+    }
+    $out = "Prompts:`n" + (($prompts | ForEach-Object { "- $_" }) -join "`n")
+    if ($last) { $out += "`n`nLast reply:`n" + $(if ($last.Length -gt 1500) { $last.Substring(0, 1500) + ' …' } else { $last }) }
+    if ($out.Length -gt $maxChars) { $out = $out.Substring(0, $maxChars) + ' …' }
+    $out
+}
+
+# One agent's (or several agents') context for a project as text: their docs, memory, a list of their
+# sessions and digests of the most recent ones. Agents never see each other's context unless asked:
+# Ctrl+Y copies only Claude's; the OliveBranch plugin is the opt-in bridge.
+function Get-AgentContext($config, [string]$project, [string[]]$Agents, [int]$RecentSessions = 3, [int]$MaxChars = 40000) {
+    $dir = Join-Path $config.ContextDir (Get-SafeName $project)
+    $index = Read-State $config 'index'
+    $pluginFolders = @($ContextSources.Values | Where-Object { $_.Folder } | ForEach-Object { $_.Folder })
+    $sb = [Text.StringBuilder]::new()
+    foreach ($agent in $Agents) {
+        $cs = $ContextSources[$agent]
+        $label = if ($cs) { $cs.Label } else { $agent }
+        $folder = if ($cs) { $cs.Folder } else { $agent }
+        $entries = @($index.Values | Where-Object { $_.project -eq $project -and ($(if ($_.agent) { $_.agent } else { 'claude' }) -eq $agent) })
+        $docs = @(Get-ProjectDocs $dir | Where-Object {
+            $top = ($_.RelPath -split '\\')[0]
+            if ($folder) { $_.RelPath -like "$folder\*" } else { -not ($_.RelPath.Contains('\') -and $top -in $pluginFolders) }
+        })
+        if (-not $entries -and -not $docs) { continue }
+        [void]$sb.AppendLine("# $label context for project $project").AppendLine()
+        foreach ($d in $docs) { [void]$sb.AppendLine("## $label doc: $($d.RelPath)").AppendLine().AppendLine((Get-Content -LiteralPath $d.FullName -Raw)).AppendLine() }
+        foreach ($m in $entries | Where-Object kind -eq 'memory') {
+            [void]$sb.AppendLine("## $label memory: $($m.title)").AppendLine().AppendLine((Get-Content -LiteralPath (Join-Path $config.ContextDir $m.file) -Raw)).AppendLine()
+        }
+        $sessions = @($entries | Where-Object kind -ne 'memory' | Sort-Object { $_.updated } -Descending)
+        if ($sessions) {
+            [void]$sb.AppendLine("## $label sessions ($($sessions.Count))").AppendLine()
+            foreach ($x in $sessions) { [void]$sb.AppendLine("- $($x.updated) · $($x.title) · $(Join-Path $config.ContextDir $x.file)") }
+            [void]$sb.AppendLine()
+            foreach ($x in $sessions | Select-Object -First $RecentSessions) {
+                $f = Join-Path $config.ContextDir $x.file
+                if (-not (Test-Path -LiteralPath $f)) { continue }
+                [void]$sb.AppendLine("## Recent $label session: $($x.title) ($($x.updated))").AppendLine().AppendLine((Get-TranscriptDigest $f)).AppendLine()
+            }
+        }
+    }
+    $text = $sb.ToString()
+    if ($text.Length -gt $MaxChars) { $text = $text.Substring(0, $MaxChars) + "`n… (truncated; open the session files listed above for more)" }
+    $text
 }
 
 # Load installed plugins (dot-sourced here so their functions and Register-ContextSource calls take effect)
