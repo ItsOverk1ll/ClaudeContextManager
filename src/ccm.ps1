@@ -232,7 +232,7 @@ function Show-PluginsMenu {
             $state = if (-not $installed.Contains($p.Name)) { "${dim}not installed$reset" }
                 elseif ([version]$installed[$p.Name].Version -lt [version]$p.Version) { "$warn[update $($installed[$p.Name].Version) → $($p.Version)]$reset" }
                 else { "$green[installed $($p.Version)]$reset" }
-            "{0,-14} {1,-56} {2}`t{0}`t{3}" -f $p.Name, (Get-OneLine $p.Description 56), $state, $p.Readme
+            "{0,-10} {1} {2,-38}`t{0}`t{3}" -f $p.Name, $state, (Get-OneLine $p.Description 38), $p.Readme
         }
         $header = "Enter install / update  ·  Ctrl+D remove  ·  Esc back`nOr paste anywhere: ${bright}ClaudeContextManager plugin install <name>$reset"
         $pick = Show-Menu @($rows) 'Plugins' $header -Expect 'ctrl-d' -Preview
