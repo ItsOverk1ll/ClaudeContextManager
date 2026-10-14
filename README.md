@@ -5,7 +5,8 @@ Plugins add context from other AI agents to your Context folder. Find the one yo
 | Plugin | What it adds | Install |
 |---|---|---|
 | [codex](plugins/codex/README.md) | OpenAI Codex CLI sessions + AGENTS.md files, sorted into your projects in a separate `codex` folder | `ClaudeContextManager plugin install codex` |
-| [olivebranch](plugins/olivebranch/README.md) | Opt-in bridge: Claude can read your Codex context and vice versa, when you ask in a session or always on for projects you choose | `ClaudeContextManager plugin install olivebranch` |
+| [gemini](plugins/gemini/README.md) | Google Gemini CLI sessions + GEMINI.md files, sorted into your projects in a separate `gemini` folder | `ClaudeContextManager plugin install gemini` |
+| [olivebranch](plugins/olivebranch/README.md) | Opt-in bridge: Claude, Codex and Gemini can read each other's context, when you ask in a session or always on for projects you choose | `ClaudeContextManager plugin install olivebranch` |
 
 You can also browse and install plugins from the menu: **ClaudeContextManager → ⧉ Plugins** (or run `ClaudeContextManager plugins`).
 

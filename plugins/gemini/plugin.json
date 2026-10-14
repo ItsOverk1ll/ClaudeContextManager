@@ -1,0 +1,7 @@
+{
+  "name": "gemini",
+  "version": "1.0.0",
+  "description": "Adds Google Gemini CLI sessions and GEMINI.md files, sorted by project in a separate gemini folder",
+  "author": "ItsOverk1ll",
+  "minCcmVersion": "1.1.0"
+}
