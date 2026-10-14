@@ -11,6 +11,10 @@
 #   .ccm\overrides.json           manual sorting (id -> project); always wins over auto-sort
 #   .ccm\projects.json            project rules: name -> { paths, keywords }
 #   .ccm\ignored.json             ids removed from the context, never re-imported
+#   <Project>\<agent>\...         context from plugin sources (e.g. codex\sessions), kept apart from Claude's
+#
+# Context sources are pluggable: the built-in one reads Claude; plugins (see the Plugins branch) call
+# Register-ContextSource to add other agents. Plugins live in %APPDATA%\ClaudeContextManager\plugins.
 
 $ErrorActionPreference = 'Stop'
 $script:AppDataDir = Join-Path $env:APPDATA 'ClaudeContextManager'
@@ -19,6 +23,29 @@ $script:ClaudeDir = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else 
 $script:DesktopDir = Join-Path $env:APPDATA 'Claude'
 $script:Unsorted = 'Unsorted'
 $script:Global = '_Global'
+$script:CcmVersion = '1.1.0'
+$script:PluginDir = Join-Path (Split-Path $ConfigFile -Parent) 'plugins'
+$script:ContextSources = [ordered]@{}
+
+# Adds a context source. Keys:
+#   Name       short id, stored with every item (index 'agent')         e.g. 'codex'
+#   Label      shown in menus and PROJECT.md                            e.g. 'Codex'
+#   Folder     subfolder of each project for its files ('' = project root)
+#   GetSources { -> objects with Id, Kind ('session'|'memory'), Path, Mtime, Size }
+#   Read       { param($src, $cache) -> item (see Read-Session); $cache is a hashtable kept for one sync }
+#   CopyDocs   { param($projects, $config) } optional: copy per-project docs (CLAUDE.md, AGENTS.md...)
+#   Resume     { param($id, $entry) } optional: reopen a session (runs in the session's folder)
+function Register-ContextSource([hashtable]$source) {
+    if (-not $source.Name -or -not $source.GetSources -or -not $source.Read) { throw 'Register-ContextSource needs Name, GetSources and Read' }
+    if (-not $source.Contains('Label')) { $source.Label = $source.Name }
+    if (-not $source.Contains('Folder')) { $source.Folder = '' }
+    $script:ContextSources[$source.Name] = $source
+}
+
+function Get-AgentLabel($entry) {
+    $agent = if ($entry.agent) { $entry.agent } else { 'claude' }
+    if ($ContextSources.Contains($agent)) { $ContextSources[$agent].Label } else { $agent }
+}
 
 #region Config and state
 
@@ -30,6 +57,8 @@ function Get-DefaultConfig {
         AutoPush    = $false
         Repo        = ''
         MinScore    = 4
+        PluginRepo  = 'ItsOverk1ll/ClaudeContextManager'
+        PluginBranch = 'Plugins'
         # Folders Claude Code gets launched from for any kind of task: a session's cwd here says nothing about its project
         GenericDirs = @($HOME, (Join-Path $HOME 'Claude'), (Join-Path $HOME '.local\bin'), [Environment]::GetFolderPath('Desktop'))
     }
@@ -297,7 +326,7 @@ function Get-ProjectRoot([string]$path, $config) {
     $isUnderHome = $p.StartsWith("$home_\", [StringComparison]::OrdinalIgnoreCase)
     $ctx = $config.ContextDir.TrimEnd('\')
     $inContext = $p.StartsWith("$ctx\", [StringComparison]::OrdinalIgnoreCase) -or $p -eq $ctx
-    $systemDir = $p -match '(?i)\\(AppData|\.claude|Temp|Windows|Program Files( \(x86\))?|ProgramData)(\\|$)'
+    $systemDir = $p -match '(?i)\\(AppData|\.claude|\.codex|Temp|Windows|Program Files( \(x86\))?|ProgramData)(\\|$)'
     $skip = $inContext -or $systemDir -or $p -notmatch '^[A-Za-z]:\\'
     if (-not $skip) {
         # nearest .git above the path
@@ -386,10 +415,12 @@ function Format-Session($s, $project, $config) {
     [void]$sb.Append((Format-Frontmatter ([ordered]@{ title = $s.Title; session = $s.Id; project = $project; source = $s.Source
         cwd = $s.Cwd; branch = $s.Branch; started = $s.Started; updated = $s.Updated; prompts = $s.Prompts })))
     [void]$sb.AppendLine("# $($s.Title)").AppendLine()
-    $resume = if ($s.Source -eq 'claude.ai') { '' } else { " · resume: ``claude --resume $($s.Id)``" }
+    $resume = if ($s.PSObject.Properties['ResumeHint']) { if ($s.ResumeHint) { " · resume: ``$($s.ResumeHint)``" } else { '' } }
+        elseif ($s.Source -eq 'claude.ai') { '' } else { " · resume: ``claude --resume $($s.Id)``" }
+    $assistant = if ($s.PSObject.Properties['AssistantName'] -and $s.AssistantName) { $s.AssistantName } else { 'Claude' }
     [void]$sb.AppendLine("> $($s.Source) · $($s.Started.ToString('yyyy-MM-dd HH:mm')) → $($s.Updated.ToString('yyyy-MM-dd HH:mm'))$resume").AppendLine()
     foreach ($t in $s.Turns) {
-        $who = if ($t.Role -eq 'user') { 'You' } else { 'Claude' }
+        $who = if ($t.Role -eq 'user') { 'You' } else { $assistant }
         $when = if ($t.Time) { " · $($t.Time.ToString('MM-dd HH:mm'))" } else { '' }
         [void]$sb.AppendLine("## $who$when").AppendLine()
         if ($t.Text.Count) { [void]$sb.AppendLine(($t.Text -join "`n`n")).AppendLine() }
@@ -401,9 +432,12 @@ function Format-Session($s, $project, $config) {
 }
 
 function Get-ItemFileName($item) {
+    $folder = if ($item.PSObject.Properties['Folder'] -and $item.Folder) { "$($item.Folder)\" } else { '' }
+    $short = if ($item.PSObject.Properties['ShortId'] -and $item.ShortId) { $item.ShortId } else { $item.Id -replace '^[a-z]+:', '' }
+    if ($short.Length -gt 8) { $short = $short.Substring(0, 8) }
     switch ($item.Kind) {
-        'memory' { "memory\$(Split-Path $item.SourcePath -Leaf)" }
-        default { "sessions\$($item.Started.ToString('yyyy-MM-dd'))_$(Get-Slug $item.Title)_$($item.Id.Replace('web:', '').Substring(0, 8)).md" }
+        'memory' { "${folder}memory\$(Split-Path $item.SourcePath -Leaf)" }
+        default { "${folder}sessions\$($item.Started.ToString('yyyy-MM-dd'))_$(Get-Slug $item.Title)_$short.md" }
     }
 }
 
@@ -418,10 +452,10 @@ function Write-ContextItem($item, $project, $config) {
 
 # Copies each project's CLAUDE.md (and the global ~/.claude/CLAUDE.md) into the Context folder
 function Copy-ClaudeMds($projects, $config) {
-    $global = Join-Path $ClaudeDir 'CLAUDE.md'
-    if (Test-Path $global) {
+    $globalFile = Join-Path $ClaudeDir 'CLAUDE.md'
+    if (Test-Path $globalFile) {
         New-Item -ItemType Directory -Force (Join-Path $config.ContextDir $Global) | Out-Null
-        Copy-Item $global (Join-Path $config.ContextDir "$Global\CLAUDE.md") -Force
+        Copy-Item $globalFile (Join-Path $config.ContextDir "$Global\CLAUDE.md") -Force
     }
     foreach ($name in $projects.Keys) {
         foreach ($root in @($projects[$name].paths)) {
@@ -444,6 +478,17 @@ function Get-ProjectNames($config) {
     @(Get-ChildItem $config.ContextDir -Directory | Where-Object { -not $_.Name.StartsWith('.') } | Select-Object -ExpandProperty Name)
 }
 
+# Files in a project folder that aren't indexed items: CLAUDE.md, codex\AGENTS.md, claude-ai-project\*...
+function Get-ProjectDocs([string]$dir) {
+    if (-not (Test-Path -LiteralPath $dir)) { return }
+    Get-ChildItem -LiteralPath $dir -File -Recurse | ForEach-Object {
+        $rel = $_.FullName.Substring($dir.TrimEnd('\').Length + 1)
+        if ($rel -ne 'PROJECT.md' -and $rel -notmatch '(^|\\)(sessions|memory)\\') {
+            $_ | Add-Member -NotePropertyName RelPath -NotePropertyValue $rel -PassThru -Force
+        }
+    } | Sort-Object { $_.RelPath.Contains('\') }, RelPath
+}
+
 function Write-ProjectIndex($project, $index, $projects, $config) {
     $dir = Join-Path $config.ContextDir (Get-SafeName $project)
     if (-not (Test-Path $dir)) { return }
@@ -457,23 +502,28 @@ function Write-ProjectIndex($project, $index, $projects, $config) {
     if ($rule -and @($rule.keywords).Count) { [void]$sb.AppendLine("**Keywords:** $(@($rule.keywords) -join ', ')  ") }
     $last = if ($sessions) { $sessions[0].updated } else { '-' }
     [void]$sb.AppendLine("**Sessions:** $($sessions.Count) · **Memory files:** $($memory.Count) · **Last activity:** $last").AppendLine()
-    $docs = Get-ChildItem $dir -File -Filter *.md | Where-Object Name -ne 'PROJECT.md'
+    $docs = @(Get-ProjectDocs $dir)
     if ($docs) {
         [void]$sb.AppendLine('## Project docs').AppendLine()
-        foreach ($d in $docs) { [void]$sb.AppendLine("- [$($d.Name)]($($d.Name))") }
+        foreach ($d in $docs) { $link = $d.RelPath -replace '\\', '/'; [void]$sb.AppendLine("- [$link]($link)") }
         [void]$sb.AppendLine()
     }
     if ($memory) {
         [void]$sb.AppendLine('## Memory').AppendLine()
-        foreach ($m in $memory) { [void]$sb.AppendLine("- [$($m.title)]($($m.file -replace '\\', '/'))") }
+        foreach ($m in $memory) { [void]$sb.AppendLine("- [$($m.title)]($(($m.file.Substring($m.file.IndexOf('\') + 1)) -replace '\\', '/'))") }
         [void]$sb.AppendLine()
     }
-    if ($sessions) {
-        [void]$sb.AppendLine('## Sessions').AppendLine()
+    # one table per agent, Claude first: plugin context stays separate
+    foreach ($group in $sessions | Group-Object { Get-AgentLabel $_ } | Sort-Object { $_.Name -ne 'Claude' }, Name) {
+        $heading = if ($group.Name -eq 'Claude') { 'Sessions' } else { "$($group.Name) sessions" }
+        [void]$sb.AppendLine("## $heading").AppendLine()
         [void]$sb.AppendLine('| Updated | Title | Source | Prompts |').AppendLine('|---|---|---|---|')
-        foreach ($x in $sessions) {
-            [void]$sb.AppendLine("| $($x.updated) | [$($x.title -replace '\|', '/')]($($x.file -replace '\\', '/')) | $($x.source) | $($x.prompts) |")
+        foreach ($x in $group.Group) {
+            # links are relative to PROJECT.md, which sits in the project folder
+            $link = ($x.file.Substring($x.file.IndexOf('\') + 1)) -replace '\\', '/'
+            [void]$sb.AppendLine("| $($x.updated) | [$($x.title -replace '\|', '/')]($link) | $($x.source) | $($x.prompts) |")
         }
+        [void]$sb.AppendLine()
     }
     Set-Content (Join-Path $dir 'PROJECT.md') $sb.ToString() -Encoding utf8NoBOM -NoNewline
 }
@@ -481,7 +531,7 @@ function Write-ProjectIndex($project, $index, $projects, $config) {
 function Write-ContextReadme($index, $config) {
     $sb = [Text.StringBuilder]::new()
     [void]$sb.AppendLine('# Context').AppendLine()
-    [void]$sb.AppendLine('Claude Code / Claude Desktop context, sorted by project by [ClaudeContextManager](https://github.com/ItsOverk1ll/ClaudeContextManager).').AppendLine()
+    [void]$sb.AppendLine('Claude Code / Claude Desktop (and plugin agent) context, sorted by project by [ClaudeContextManager](https://github.com/ItsOverk1ll/ClaudeContextManager).').AppendLine()
     [void]$sb.AppendLine('| Project | Sessions | Memory | Last activity |').AppendLine('|---|---|---|---|')
     $groups = $index.Values | Group-Object project | Sort-Object { @($_.Group.updated | Sort-Object)[-1] } -Descending
     foreach ($g in $groups) {
@@ -498,8 +548,8 @@ function Write-ContextReadme($index, $config) {
 
 #region Sync
 
-function New-IndexEntry($item, $project, $rel, $source, [bool]$auto) {
-    [ordered]@{ kind = $item.Kind; project = $project; auto = $auto; file = $rel; title = $item.Title; source = $item.Source
+function New-IndexEntry($item, $project, $rel, $source, [bool]$auto, [string]$agent = 'claude') {
+    [ordered]@{ kind = $item.Kind; agent = $agent; project = $project; auto = $auto; file = $rel; title = $item.Title; source = $item.Source
         cwd = $item.Cwd; started = $item.Started.ToString('yyyy-MM-dd HH:mm'); updated = $item.Updated.ToString('yyyy-MM-dd HH:mm')
         prompts = $item.Prompts; sourcePath = $item.SourcePath; mtime = $source.Mtime; size = $source.Size }
 }
@@ -513,7 +563,7 @@ function Invoke-WithLock($config, [scriptblock]$action) {
 }
 
 # Places one parsed item: keeps manual sorting, re-sorts auto-sorted items, writes the file, updates the index.
-function Save-ContextItem($item, $source, $index, $overrides, $projects, $config, [switch]$Resort) {
+function Save-ContextItem($item, $source, $index, $overrides, $projects, $config, [switch]$Resort, [string]$Agent = 'claude') {
     $old = $index[$item.Id]
     $auto = $true
     if ($overrides.Contains($item.Id)) { $project = $overrides[$item.Id]; $auto = $false }
@@ -525,7 +575,7 @@ function Save-ContextItem($item, $source, $index, $overrides, $projects, $config
     if ($old -and $old.file -and $old.file -ne $rel) {
         Remove-Item -LiteralPath (Join-Path $config.ContextDir $old.file) -ErrorAction SilentlyContinue
     }
-    $index[$item.Id] = New-IndexEntry $item $project $rel $source $auto
+    $index[$item.Id] = New-IndexEntry $item $project $rel $source $auto $Agent
     @($project, $old.project) | Where-Object { $_ }
 }
 
@@ -535,25 +585,28 @@ function Invoke-Sync($config, [switch]$Quiet, [switch]$Resort, [switch]$Push) {
         $overrides = Read-State $config 'overrides'
         $projects = Read-State $config 'projects'
         $ignored = Read-State $config 'ignored'
-        $desktop = Get-DesktopSessionInfo
         $touched = [Collections.Generic.HashSet[string]]::new()
         $count = 0
-        $sources = @(Get-SessionSources) + @(Get-MemorySources)
-        $i = 0
-        foreach ($src in $sources) {
-            $i++
-            if ($ignored.Contains($src.Id)) { continue }
-            $old = $index[$src.Id]
-            if (-not $Resort -and $old -and $old.mtime -eq $src.Mtime -and $old.size -eq $src.Size -and
-                (Test-Path -LiteralPath (Join-Path $config.ContextDir $old.file))) { continue }
-            if (-not $Quiet) { Write-Progress -Activity 'Syncing context' -Status (Split-Path $src.Path -Leaf) -PercentComplete (100 * $i / $sources.Count) }
-            try {
-                $item = if ($src.Kind -eq 'memory') { Read-Memory $src } else { Read-Session $src $desktop }
-                if ($item.Kind -eq 'session' -and $item.Turns.Count -eq 0) { continue }
-                foreach ($p in (Save-ContextItem $item $src $index $overrides $projects $config -Resort:$Resort)) { [void]$touched.Add($p) }
-                $count++
-            } catch {
-                if (-not $Quiet) { Write-Warn "Skipped $($src.Path): $_" }
+        foreach ($cs in $ContextSources.Values) {
+            try { $sources = @(& $cs.GetSources) } catch { if (-not $Quiet) { Write-Warn "$($cs.Label): couldn't list sources: $_" }; continue }
+            $cache = @{}
+            $i = 0
+            foreach ($src in $sources) {
+                $i++
+                if ($ignored.Contains($src.Id)) { continue }
+                $old = $index[$src.Id]
+                if (-not $Resort -and $old -and $old.mtime -eq $src.Mtime -and $old.size -eq $src.Size -and
+                    (Test-Path -LiteralPath (Join-Path $config.ContextDir $old.file))) { continue }
+                if (-not $Quiet) { Write-Progress -Activity "Syncing $($cs.Label) context" -Status (Split-Path $src.Path -Leaf) -PercentComplete (100 * $i / $sources.Count) }
+                try {
+                    $item = & $cs.Read $src $cache
+                    if (-not $item -or ($item.Kind -ne 'memory' -and $item.Turns.Count -eq 0)) { continue }
+                    if ($cs.Folder -and -not $item.PSObject.Properties['Folder']) { $item | Add-Member -NotePropertyName Folder -NotePropertyValue $cs.Folder }
+                    foreach ($p in (Save-ContextItem $item $src $index $overrides $projects $config -Resort:$Resort -Agent $cs.Name)) { [void]$touched.Add($p) }
+                    $count++
+                } catch {
+                    if (-not $Quiet) { Write-Warn "Skipped $($src.Path): $_" }
+                }
             }
         }
         if ($Resort) {
@@ -571,7 +624,10 @@ function Invoke-Sync($config, [switch]$Quiet, [switch]$Resort, [switch]$Push) {
             }
         }
         if (-not $Quiet) { Write-Progress -Activity 'Syncing context' -Completed }
-        Copy-ClaudeMds $projects $config
+        foreach ($cs in $ContextSources.Values) {
+            if (-not $cs.CopyDocs) { continue }
+            try { & $cs.CopyDocs $projects $config } catch { if (-not $Quiet) { Write-Warn "$($cs.Label) docs: $_" } }
+        }
         Write-State $config 'index' $index
         Write-State $config 'projects' $projects
         foreach ($p in $touched) { Write-ProjectIndex $p $index $projects $config }
@@ -588,10 +644,8 @@ function Invoke-Sync($config, [switch]$Quiet, [switch]$Resort, [switch]$Push) {
 function Remove-EmptyProjects($config) {
     foreach ($name in Get-ProjectNames $config) {
         $dir = Join-Path $config.ContextDir $name
-        foreach ($sub in 'sessions', 'memory') {
-            $s = Join-Path $dir $sub
-            if ((Test-Path $s) -and -not (Get-ChildItem $s -Force)) { Remove-Item $s }
-        }
+        Get-ChildItem -LiteralPath $dir -Directory -Recurse | Sort-Object { $_.FullName.Length } -Descending |
+            Where-Object { -not (Get-ChildItem -LiteralPath $_.FullName -Force) } | Remove-Item
         $left = Get-ChildItem $dir -Force | Where-Object Name -ne 'PROJECT.md'
         if (-not $left) { Remove-Item $dir -Recurse -Force }
     }
@@ -672,8 +726,11 @@ function Rename-ContextProject($config, $old, $new) {
         if (Test-Path $to) {
             # merge into the existing project
             foreach ($id in @($index.Keys | Where-Object { $index[$_].project -eq $old })) { Move-IndexedFile $index $id $new $config }
-            Get-ChildItem $from -File -ErrorAction SilentlyContinue | Where-Object Name -ne 'PROJECT.md' |
-                ForEach-Object { Move-Item -LiteralPath $_.FullName (Join-Path $to $_.Name) -Force }
+            foreach ($d in @(Get-ProjectDocs $from)) {
+                $dest = Join-Path $to $d.RelPath
+                New-Item -ItemType Directory -Force (Split-Path $dest -Parent) | Out-Null
+                Move-Item -LiteralPath $d.FullName $dest -Force
+            }
             Remove-Item $from -Recurse -Force -ErrorAction SilentlyContinue
         } elseif (Test-Path $from) { Rename-Item -LiteralPath $from (Split-Path $to -Leaf) }
         foreach ($id in @($index.Keys)) {
@@ -940,5 +997,113 @@ function Install-SyncTask {
 }
 
 function Uninstall-SyncTask { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue }
+
+#endregion
+
+#region Plugins
+
+# The built-in source: Claude Code (CLI + Desktop Code tab) sessions, Claude memory and CLAUDE.md files
+Register-ContextSource @{
+    Name       = 'claude'
+    Label      = 'Claude'
+    GetSources = { @(Get-SessionSources) + @(Get-MemorySources) }
+    Read       = {
+        param($src, $cache)
+        if ($src.Kind -eq 'memory') { return (Read-Memory $src) }
+        if (-not $cache.Contains('Desktop')) { $cache.Desktop = Get-DesktopSessionInfo }
+        Read-Session $src $cache.Desktop
+    }
+    CopyDocs   = { param($projects, $config) Copy-ClaudeMds $projects $config }
+    Resume     = { param($id, $entry) & claude --resume $id }
+}
+
+function Read-PluginManifest([string]$dir) {
+    $file = Join-Path $dir 'plugin.json'
+    if (-not (Test-Path -LiteralPath $file)) { return $null }
+    $m = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json -AsHashtable
+    [pscustomobject]@{ Name = $m.name; Version = $m.version; Description = $m.description; Author = $m.author
+        MinCcmVersion = $m.minCcmVersion ?? '1.1.0'; Path = $dir; Readme = (Join-Path $dir 'README.md') }
+}
+
+function Get-InstalledPlugins {
+    if (-not (Test-Path $PluginDir)) { return @() }
+    @(Get-ChildItem $PluginDir -Directory | ForEach-Object { Read-PluginManifest $_.FullName } | Where-Object { $_ })
+}
+
+# Shallow clone of the repo's Plugins branch, refreshed on every call; returns the folder
+function Update-PluginCatalog($config) {
+    $cache = Join-Path (Split-Path $ConfigFile -Parent) 'plugin-catalog'
+    $url = "https://github.com/$($config.PluginRepo).git"
+    if (Test-Path (Join-Path $cache '.git')) {
+        $out = & git -C $cache fetch --depth 1 origin $config.PluginBranch 2>&1
+        if ($LASTEXITCODE -eq 0) { & git -C $cache reset --hard FETCH_HEAD *> $null; return $cache }
+        Remove-Item $cache -Recurse -Force
+    }
+    $out = & git clone --quiet --depth 1 --single-branch --branch $config.PluginBranch $url $cache 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "Couldn't download the plugin list from $url ($($config.PluginBranch) branch). If the repo is private, sign in first: gh auth login, then gh auth setup-git.`n$($out | Out-String)"
+    }
+    $cache
+}
+
+function Get-AvailablePlugins($catalog) {
+    $dir = Join-Path $catalog 'plugins'
+    if (-not (Test-Path $dir)) { return @() }
+    @(Get-ChildItem $dir -Directory | ForEach-Object { Read-PluginManifest $_.FullName } | Where-Object { $_ } | Sort-Object Name)
+}
+
+# Installs (or updates) a plugin by name from the Plugins branch, or from a local folder for plugin development
+function Install-CcmPlugin($config, [string]$nameOrPath) {
+    $src = if (Test-Path -LiteralPath (Join-Path $nameOrPath 'plugin.json')) { Read-PluginManifest (Resolve-Path -LiteralPath $nameOrPath).Path }
+        else {
+            $catalog = Update-PluginCatalog $config
+            $found = Get-AvailablePlugins $catalog | Where-Object Name -eq $nameOrPath
+            if (-not $found) { throw "No plugin named '$nameOrPath'. Available: $((Get-AvailablePlugins $catalog).Name -join ', ')" }
+            $found
+        }
+    if ([version]$src.MinCcmVersion -gt [version]$CcmVersion) {
+        throw "$($src.Name) needs ClaudeContextManager $($src.MinCcmVersion) or newer (you have $CcmVersion). Update: git pull in your clone, then pwsh -File install.ps1"
+    }
+    if ($src.Name -notmatch '^[a-z0-9][a-z0-9-]*$') { throw "Invalid plugin name '$($src.Name)'" }
+    $dest = Join-Path $PluginDir $src.Name
+    if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+    New-Item -ItemType Directory -Force $dest | Out-Null
+    Get-ChildItem -LiteralPath $src.Path -Force | Where-Object Name -ne '.git' | Copy-Item -Destination $dest -Recurse -Force
+    Read-PluginManifest $dest
+}
+
+# Removes a plugin; with -RemoveContext also deletes the context it added to the Context folder
+function Uninstall-CcmPlugin($config, [string]$name, [switch]$RemoveContext) {
+    $dir = Join-Path $PluginDir $name
+    if (-not (Test-Path $dir)) { throw "Plugin '$name' isn't installed." }
+    Remove-Item $dir -Recurse -Force
+    if (-not $RemoveContext) { return }
+    Invoke-WithLock $config {
+        $index = Read-State $config 'index'
+        $projects = Read-State $config 'projects'
+        $touched = @{}
+        foreach ($id in @($index.Keys | Where-Object { $index[$_].agent -eq $name })) {
+            $e = $index[$id]
+            Remove-Item -LiteralPath (Join-Path $config.ContextDir $e.file) -ErrorAction SilentlyContinue
+            $touched[$e.project] = $true
+            $index.Remove($id)
+        }
+        # the plugin's doc folders (e.g. <Project>\codex) go too
+        foreach ($p in Get-ProjectNames $config) {
+            $sub = Join-Path $config.ContextDir "$p\$name"
+            if (Test-Path -LiteralPath $sub) { Remove-Item -LiteralPath $sub -Recurse -Force; $touched[$p] = $true }
+        }
+        Write-State $config 'index' $index
+        foreach ($p in $touched.Keys) { Write-ProjectIndex $p $index $projects $config }
+        Remove-EmptyProjects $config
+        Write-ContextReadme $index $config
+    } | Out-Null
+}
+
+# Load installed plugins (dot-sourced here so their functions and Register-ContextSource calls take effect)
+foreach ($pluginScript in @(Get-ChildItem $PluginDir -Directory -ErrorAction SilentlyContinue | ForEach-Object { Join-Path $_.FullName 'plugin.ps1' } | Where-Object { Test-Path $_ })) {
+    try { . $pluginScript } catch { Write-Host "  Plugin $(Split-Path (Split-Path $pluginScript -Parent) -Leaf) failed to load: $_" }
+}
+Remove-Variable pluginScript -ErrorAction SilentlyContinue
 
 #endregion

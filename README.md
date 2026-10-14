@@ -30,11 +30,22 @@ Setup asks:
 | `ccm import <zip>` | import a claude.ai data export |
 | `ccm setup` | run setup again |
 | `ccm open` | open the Context folder |
+| `ccm plugins` | browse and install plugins (`plugin install/update/remove/list <name>`) |
 | `ccm uninstall` | remove hook, task and command (keeps your context) |
 
 **Main menu:** Enter open project · Ctrl+S sync · Ctrl+N new project · Ctrl+R rename/merge · Ctrl+Y copy the project's context (docs + memory) to paste into Claude · Ctrl+O open folder
 
 **Project menu:** Enter open file · Ctrl+V move to another project · Ctrl+R resume the session in Claude Code · Ctrl+Y copy · Ctrl+D remove (never re-imported) · Ctrl+O folder
+
+## Plugins
+
+Plugins add context from other AI agents, sorted into the same projects but kept in their own subfolder. Browse them in the menu (**⧉ Plugins**) or on the [Plugins branch](https://github.com/ItsOverk1ll/ClaudeContextManager/tree/Plugins), then install with one command:
+
+```powershell
+ClaudeContextManager plugin install codex     # OpenAI Codex CLI sessions + AGENTS.md
+```
+
+`plugin list`, `plugin update` and `plugin remove <name>` manage them. The Plugins branch README explains how to write one.
 
 ## Context folder
 

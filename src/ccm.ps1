@@ -7,6 +7,8 @@
 #   ccm push            commit and push the Context folder to its GitHub repo
 #   ccm import <path>   import a claude.ai data export (.zip or folder) - Claude Desktop chats
 #   ccm open            open the Context folder in Explorer
+#   ccm plugins         browse plugins (e.g. Codex) and install them
+#   ccm plugin install <name>   install or update a plugin   (also: plugin remove <name>, plugin list)
 #   ccm uninstall       remove the hook, scheduled task and the ccm / ClaudeContextManager commands (keeps your Context folder)
 
 param([Parameter(Position = 0)][string]$Command = 'menu', [Parameter(Position = 1, ValueFromRemainingArguments)][string[]]$Rest = @())
@@ -130,8 +132,12 @@ function New-ProjectPrompt($config) {
 function Copy-ProjectContext($config, $project) {
     $dir = Join-Path $config.ContextDir (Get-SafeName $project)
     $parts = @()
-    foreach ($f in @(Get-ChildItem $dir -File -Filter *.md) + @(Get-ChildItem (Join-Path $dir 'memory') -File -ErrorAction SilentlyContinue)) {
-        $parts += "<!-- $($f.Name) -->`n$(Get-Content -LiteralPath $f.FullName -Raw)"
+    $pm = Join-Path $dir 'PROJECT.md'
+    if (Test-Path -LiteralPath $pm) { $parts += "<!-- PROJECT.md -->`n$(Get-Content -LiteralPath $pm -Raw)" }
+    $memory = Get-ChildItem $dir -Recurse -File -Filter *.md | Where-Object { $_.Directory.Name -eq 'memory' }
+    foreach ($f in @(Get-ProjectDocs $dir) + @($memory)) {
+        $name = if ($f.RelPath) { $f.RelPath } else { "memory\$($f.Name)" }
+        $parts += "<!-- $name -->`n$(Get-Content -LiteralPath $f.FullName -Raw)"
     }
     $text = "Context for project ${project} (from my Context folder: $dir)`n`n" + ($parts -join "`n`n")
     Set-Clipboard -Value $text
@@ -145,22 +151,23 @@ function Show-ProjectMenu($config, $project) {
         $dir = Join-Path $config.ContextDir (Get-SafeName $project)
         if (-not (Test-Path $dir)) { return }
         $rows = @()
-        foreach ($f in Get-ChildItem $dir -File | Sort-Object { $_.Name -ne 'PROJECT.md' }, Name) {
-            $rows += "$green◆$reset $($f.Name)`tfile:$($f.Name)`t$($f.FullName)"
+        $pm = Join-Path $dir 'PROJECT.md'
+        if (Test-Path -LiteralPath $pm) { $rows += "$green◆$reset PROJECT.md`tfile:PROJECT.md`t$pm" }
+        foreach ($f in Get-ProjectDocs $dir) {
+            $label = $f.RelPath -replace '^claude-ai-project\\', 'claude.ai project / ' -replace '\\', ' / '
+            $rows += "$green◆$reset $label`tfile:$($f.RelPath)`t$($f.FullName)"
         }
-        $sub = Join-Path $dir 'claude-ai-project'
-        if (Test-Path $sub) { foreach ($f in Get-ChildItem $sub -File) { $rows += "$green◆$reset claude.ai project / $($f.Name)`tfile:claude-ai-project\$($f.Name)`t$($f.FullName)" } }
         $items = @($index.GetEnumerator() | Where-Object { $_.Value.project -eq $project })
         foreach ($m in $items | Where-Object { $_.Value.kind -eq 'memory' } | Sort-Object { $_.Value.title }) {
             $rows += "$green✎$reset {0,-46} ${dim}memory$reset`t{1}`t{2}" -f (Get-OneLine $m.Value.title 46), $m.Key, (Join-Path $config.ContextDir $m.Value.file)
         }
         foreach ($s in $items | Where-Object { $_.Value.kind -ne 'memory' } | Sort-Object { $_.Value.updated } -Descending) {
             $e = $s.Value
-            $src = switch ($e.source) { 'Claude Desktop' { 'Desktop' } 'claude.ai' { 'claude.ai' } default { 'CLI' } }
+            $src = switch ($e.source) { 'Claude Desktop' { 'Desktop' } 'claude.ai' { 'claude.ai' } 'Claude Code CLI' { 'CLI' } default { Get-AgentLabel $e } }
             $pin = if ($e.auto) { ' ' } else { "$green•$reset" }
             $rows += "$dim$($e.updated.Substring(5, 5))$reset$pin{0,-40} $dim{1,-7}{2,3}p$reset`t{3}`t{4}" -f (Get-OneLine $e.title 40), $src, $e.prompts, $s.Key, (Join-Path $config.ContextDir $e.file)
         }
-        $header = "Enter open  ·  Ctrl+V move to project  ·  Ctrl+R resume in Claude  ·  Esc back`n" +
+        $header = "Enter open  ·  Ctrl+V move to project  ·  Ctrl+R resume session  ·  Esc back`n" +
             "Ctrl+Y copy  ·  Ctrl+D remove  ·  Ctrl+O folder  ·  $green•$reset sorted by hand"
         $pick = Show-Menu $rows $project $header -Expect 'ctrl-v', 'ctrl-r', 'ctrl-y', 'ctrl-d', 'ctrl-o' -Preview
         if (-not $pick) { return }
@@ -176,11 +183,13 @@ function Show-ProjectMenu($config, $project) {
             }
             'ctrl-r' {
                 $e = $index[$id]
-                if (-not $e -or $e.kind -ne 'session') { Write-Warn 'Only Claude Code sessions can be resumed.'; Start-Sleep 1; break }
+                $agent = if ($e.agent) { $e.agent } else { 'claude' }
+                $resume = if ($e -and $e.kind -eq 'session' -and $ContextSources.Contains($agent)) { $ContextSources[$agent].Resume }
+                if (-not $resume) { Write-Warn 'This item has no session to resume (claude.ai chats and memory files can''t be resumed).'; Start-Sleep 1; break }
                 Clear-Host
                 $cwd = if ($e.cwd -and (Test-Path -LiteralPath $e.cwd)) { $e.cwd } else { $HOME }
                 Push-Location $cwd
-                try { & claude --resume $id } finally { Pop-Location }
+                try { & $resume $id $e } catch { Write-Warn "$_"; Wait-Key } finally { Pop-Location }
             }
             'ctrl-y' { Set-Clipboard -Value (Get-Content -LiteralPath $path -Raw); Write-Ok 'Copied to the clipboard.'; Start-Sleep -Milliseconds 700 }
             'ctrl-d' {
@@ -190,6 +199,52 @@ function Show-ProjectMenu($config, $project) {
             }
             default { Open-File $path }
         }
+    }
+}
+
+function Install-PluginNow($config, $name) {
+    try {
+        Write-Info "Installing $name..."
+        $m = Install-CcmPlugin $config $name
+        Write-Ok "Installed $($m.Name) $($m.Version)."
+        if (Test-Configured) {
+            Write-Info 'Syncing so its context shows up...'
+            # a fresh process, so the plugin loads like it will from now on
+            & (Get-Process -Id $PID).Path -NoProfile -File $PSCommandPath sync | Out-Host
+        }
+    } catch { Write-Warn "$_" }
+}
+
+function Remove-PluginNow($config, $name) {
+    $keep = Read-YesNo "Keep the $name context already in your Context folder?" $true
+    try { Uninstall-CcmPlugin $config $name -RemoveContext:(-not $keep); Write-Ok "Removed $name." } catch { Write-Warn "$_" }
+}
+
+function Show-PluginsMenu {
+    $config = Get-Config
+    Clear-Host
+    Write-Info 'Getting the plugin list...'
+    try { $catalog = Update-PluginCatalog $config } catch { Write-Warn "$_"; Wait-Key; return }
+    while ($true) {
+        $installed = @{}
+        foreach ($p in Get-InstalledPlugins) { $installed[$p.Name] = $p }
+        $rows = foreach ($p in Get-AvailablePlugins $catalog) {
+            $state = if (-not $installed.Contains($p.Name)) { "${dim}not installed$reset" }
+                elseif ([version]$installed[$p.Name].Version -lt [version]$p.Version) { "$warn[update $($installed[$p.Name].Version) → $($p.Version)]$reset" }
+                else { "$green[installed $($p.Version)]$reset" }
+            "{0,-14} {1,-56} {2}`t{0}`t{3}" -f $p.Name, (Get-OneLine $p.Description 56), $state, $p.Readme
+        }
+        $header = "Enter install / update  ·  Ctrl+D remove  ·  Esc back`nOr paste anywhere: ${bright}ClaudeContextManager plugin install <name>$reset"
+        $pick = Show-Menu @($rows) 'Plugins' $header -Expect 'ctrl-d' -Preview
+        if (-not $pick -or -not $pick.Row) { return }
+        Clear-Host
+        if ($pick.Key -eq 'ctrl-d') {
+            if ($installed.Contains($pick.Row)) { Remove-PluginNow $config $pick.Row } else { Write-Info "$($pick.Row) isn't installed." }
+        } else { Install-PluginNow $config $pick.Row }
+        Wait-Key
+        # reload so the menus see the plugin's source right away
+        & (Get-Process -Id $PID).Path -NoProfile -File $PSCommandPath menu
+        exit 0
     }
 }
 
@@ -211,6 +266,7 @@ function Show-SettingsMenu {
             "Import claude.ai / Desktop chat export...`timport",
             "Re-sort everything ${dim}(keeps what you sorted by hand)$reset`tresort",
             "Edit project rules ${dim}(.ccm\projects.json: folders + keywords per project)$reset`trules",
+            "Plugins ${dim}(add Codex and other agents' context)$reset`tplugins",
             "Run setup again`tsetup"
         )
         $pick = Show-Menu $rows 'Settings' 'Enter toggle / change  ·  Esc back'
@@ -248,6 +304,7 @@ function Show-SettingsMenu {
                 Open-File $file
                 Write-Info 'Save the file, then use Re-sort everything to apply the new rules.'; Start-Sleep 2
             }
+            'plugins' { Show-PluginsMenu }
             'setup' { Invoke-Setup }
         }
     }
@@ -260,7 +317,7 @@ function Show-MainMenu {
         $stats = Get-ProjectStats $config
         $rows = @("$green↻ Sync now$reset`t+sync")
         if ($config.Repo) { $rows += "$green↑ Push to GitHub$reset $dim$($config.Repo)$reset`t+push" }
-        $rows += "$green+ New project$reset`t+new", "$green≡ Settings$reset`t+settings"
+        $rows += "$green+ New project$reset`t+new", "$green⧉ Plugins$reset`t+plugins", "$green≡ Settings$reset`t+settings"
         # most recently active first, Unsorted and _Global last
         $names = $stats.Keys | Sort-Object @{ e = { $_ -in $Unsorted, $Global } }, @{ e = { $stats[$_].Last }; Descending = $true }
         foreach ($name in $names) {
@@ -295,6 +352,7 @@ function Show-MainMenu {
             '+push' { Push-Context $config; Start-Sleep -Milliseconds 1200 }
             '+new' { $n = New-ProjectPrompt $config; if ($n) { Show-ProjectMenu $config $n } }
             '+settings' { Show-SettingsMenu }
+            '+plugins' { Show-PluginsMenu }
             default { Show-ProjectMenu $config $row }
         }
     }
@@ -329,6 +387,34 @@ switch ($Command) {
         $n = Import-ClaudeExport (Get-Config) $params[0]; Write-Ok "Imported $n conversation(s)."
     }
     'open' { Start-Process explorer.exe (Get-Config).ContextDir }
+    'plugins' { Show-PluginsMenu }
+    'plugin' {
+        $config = Get-Config
+        $action = if ($params.Count) { $params[0] } else { 'list' }
+        $name = if ($params.Count -gt 1) { $params[1] } else { '' }
+        switch ($action) {
+            'install' {
+                if (-not $name) { Write-Warn 'Usage: ClaudeContextManager plugin install <name>'; exit 1 }
+                Install-PluginNow $config $name
+            }
+            'update' {
+                foreach ($p in Get-InstalledPlugins) { if (-not $name -or $p.Name -eq $name) { Install-PluginNow $config $p.Name } }
+            }
+            { $_ -in 'remove', 'uninstall' } {
+                if (-not $name) { Write-Warn 'Usage: ClaudeContextManager plugin remove <name>'; exit 1 }
+                Remove-PluginNow $config $name
+            }
+            'list' {
+                $installed = Get-InstalledPlugins
+                Write-Host "  ${green}Installed:$reset $(if ($installed) { ($installed | ForEach-Object { "$($_.Name) $($_.Version)" }) -join ', ' } else { 'none' })"
+                try {
+                    foreach ($p in Get-AvailablePlugins (Update-PluginCatalog $config)) { Write-Host ("  {0,-14} {1,-8} {2}" -f $p.Name, $p.Version, $p.Description) }
+                    Write-Info 'Install one with: ClaudeContextManager plugin install <name>'
+                } catch { Write-Warn "$_" }
+            }
+            default { Write-Warn 'Usage: ClaudeContextManager plugin install|update|remove|list [name]' }
+        }
+    }
     'uninstall' { Uninstall-Ccm }
-    default { Get-Content $PSCommandPath | Select-Object -Skip 2 -First 9 | ForEach-Object { $_.TrimStart('#') } }
+    default { Get-Content $PSCommandPath | Select-Object -Skip 2 -First 11 | ForEach-Object { $_.TrimStart('#') } }
 }
