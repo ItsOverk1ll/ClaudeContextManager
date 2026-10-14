@@ -81,6 +81,7 @@ function Invoke-ClaudeHeadless([string]$prompt, [string]$stdin, [string]$model, 
     $psi.WorkingDirectory = $SummarizerDir
     $psi.RedirectStandardInput = $psi.RedirectStandardOutput = $psi.RedirectStandardError = $true
     $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true      # fully detached from your terminal, so it can't touch its input
     $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
     # drop the variables that mark "running inside a Claude session" (keep CLAUDE_CONFIG_DIR: it says where you're signed in)
     foreach ($k in @($psi.Environment.Keys | Where-Object { $_ -like 'CLAUDE*' -and $_ -ne 'CLAUDE_CONFIG_DIR' })) { [void]$psi.Environment.Remove($k) }

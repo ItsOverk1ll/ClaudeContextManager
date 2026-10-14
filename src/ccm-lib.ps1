@@ -5,7 +5,7 @@
 # Context folder layout:
 #   <Project>\PROJECT.md          generated overview (sessions, memory, sources)
 #   <Project>\CLAUDE.md           copy of the project's CLAUDE.md
-#   <Project>\memory\*.md         Claude memory files that belong to the project
+#   _Memory\<Agent>\*.md          memory files (e.g. Claude's), each linked to the project it's about
 #   <Project>\sessions\*.md       one Markdown transcript per session/conversation
 #   .ccm\index.json               every item: id -> project, file, source, timestamps
 #   .ccm\overrides.json           manual sorting (id -> project); always wins over auto-sort
@@ -23,7 +23,8 @@ $script:ClaudeDir = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else 
 $script:DesktopDir = Join-Path $env:APPDATA 'Claude'
 $script:Unsorted = 'Unsorted'
 $script:Global = '_Global'
-$script:CcmVersion = '1.3.1'
+$script:MemoryRoot = '_Memory'      # memory files live here by agent, not inside projects
+$script:CcmVersion = '1.4.0'
 $script:PluginDir = Join-Path (Split-Path $ConfigFile -Parent) 'plugins'
 $script:ContextSources = [ordered]@{}
 
@@ -496,8 +497,22 @@ function Get-ItemFileName($item) {
     }
 }
 
-function Write-ContextItem($item, $project, $config) {
-    $rel = Join-Path (Get-SafeName $project) (Get-ItemFileName $item)
+# Memory files go to _Memory\<Agent>\<file>.md; two agents' folders (or two Claude project folders) can hold
+# files with the same name, so a clash gets the source folder added to the name
+function Get-MemoryRel($item, $index, [string]$agent) {
+    $label = Get-SafeName $(if ($ContextSources.Contains($agent)) { $ContextSources[$agent].Label } else { $agent })
+    $leaf = Split-Path $item.SourcePath -Leaf
+    $rel = Join-Path $MemoryRoot (Join-Path $label $leaf)
+    $taken = @($index.GetEnumerator() | Where-Object { $_.Key -ne $item.Id -and $_.Value.file -eq $rel }).Count
+    if ($taken) {
+        $from = Get-Slug (Split-Path (Split-Path (Split-Path $item.SourcePath -Parent) -Parent) -Leaf) 24
+        $rel = Join-Path $MemoryRoot (Join-Path $label "$([IO.Path]::GetFileNameWithoutExtension($leaf))-$from.md")
+    }
+    $rel
+}
+
+function Write-ContextItem($item, $project, $config, [string]$rel = '') {
+    if (-not $rel) { $rel = Join-Path (Get-SafeName $project) (Get-ItemFileName $item) }
     $full = Join-Path $config.ContextDir $rel
     New-Item -ItemType Directory -Force (Split-Path $full -Parent) | Out-Null
     $content = if ($item.Kind -eq 'memory') { if ($config.Redact) { Protect-Secrets $item.Raw } else { $item.Raw } } else { Format-Session $item $project $config }
@@ -530,7 +545,7 @@ function Copy-ClaudeMds($projects, $config) {
 
 function Get-ProjectNames($config) {
     if (-not (Test-Path $config.ContextDir)) { return @() }
-    @(Get-ChildItem $config.ContextDir -Directory | Where-Object { -not $_.Name.StartsWith('.') } | Select-Object -ExpandProperty Name)
+    @(Get-ChildItem $config.ContextDir -Directory | Where-Object { -not $_.Name.StartsWith('.') -and $_.Name -ne $MemoryRoot } | Select-Object -ExpandProperty Name)
 }
 
 # Files in a project folder that aren't indexed items: CLAUDE.md, codex\AGENTS.md, claude-ai-project\*...
@@ -549,7 +564,8 @@ function Write-ProjectIndex($project, $index, $projects, $config) {
     if (-not (Test-Path $dir)) { return }
     $items = @($index.Values | Where-Object { $_.project -eq $project })
     $sessions = @($items | Where-Object kind -ne 'memory' | Sort-Object { $_.updated } -Descending)
-    $memory = @($items | Where-Object kind -eq 'memory' | Sort-Object { $_.title })
+    # memory linked to a real project is listed with it; "general" memory (Unsorted) lives only in the Memory menu
+    $memory = @($items | Where-Object { $_.kind -eq 'memory' -and $project -ne $Unsorted } | Sort-Object { $_.title })
     $sb = [Text.StringBuilder]::new()
     [void]$sb.AppendLine("# $project").AppendLine()
     $rule = $projects[$project]
@@ -577,7 +593,7 @@ function Write-ProjectIndex($project, $index, $projects, $config) {
     }
     if ($memory) {
         [void]$sb.AppendLine('## Memory').AppendLine()
-        foreach ($m in $memory) { [void]$sb.AppendLine("- [$($m.title)]($(($m.file.Substring($m.file.IndexOf('\') + 1)) -replace '\\', '/'))") }
+        foreach ($m in $memory) { [void]$sb.AppendLine("- [$($m.title)](../$($m.file -replace '\\', '/')) · $(Get-AgentLabel $m)") }
         [void]$sb.AppendLine()
     }
     # one table per agent, Claude first: plugin context stays separate
@@ -601,11 +617,13 @@ function Write-ContextReadme($index, $config) {
     $sb = [Text.StringBuilder]::new()
     [void]$sb.AppendLine('# Context').AppendLine()
     [void]$sb.AppendLine('Claude Code / Claude Desktop (and plugin agent) context, sorted by project by [ClaudeContextManager](https://github.com/ItsOverk1ll/ClaudeContextManager).').AppendLine()
+    $memCount = @($index.Values | Where-Object kind -eq 'memory').Count
+    if ($memCount) { [void]$sb.AppendLine("Memory: $memCount file(s) in [$MemoryRoot]($MemoryRoot/), by agent.").AppendLine() }
     [void]$sb.AppendLine('| Project | Sessions | Memory | Last activity |').AppendLine('|---|---|---|---|')
     $groups = $index.Values | Group-Object project | Sort-Object { @($_.Group.updated | Sort-Object)[-1] } -Descending
     foreach ($g in $groups) {
         $s = @($g.Group | Where-Object kind -ne 'memory')
-        $m = @($g.Group | Where-Object kind -eq 'memory')
+        $m = @($g.Group | Where-Object { $_.kind -eq 'memory' -and $g.Name -ne $Unsorted })
         $last = @($g.Group.updated | Sort-Object)[-1]
         [void]$sb.AppendLine("| [$($g.Name)]($([uri]::EscapeDataString((Get-SafeName $g.Name)))/PROJECT.md) | $($s.Count) | $($m.Count) | $last |")
     }
@@ -651,7 +669,8 @@ function Save-ContextItem($item, $source, $index, $overrides, $projects, $config
     else { $project = $Unsorted }
     $compact = [bool]($old -and $old.compact)      # cleaned up earlier: keep it without tool lines
     if ($compact) { $item | Add-Member -NotePropertyName Compact -NotePropertyValue $true -Force }
-    $rel = Write-ContextItem $item $project $config
+    $memRel = if ($item.Kind -eq 'memory') { Get-MemoryRel $item $index $Agent } else { '' }
+    $rel = Write-ContextItem $item $project $config $memRel
     if ($old -and $old.file -and $old.file -ne $rel) {
         Remove-Item -LiteralPath (Join-Path $config.ContextDir $old.file) -ErrorAction SilentlyContinue
     }
@@ -659,7 +678,7 @@ function Save-ContextItem($item, $source, $index, $overrides, $projects, $config
     @($project, $old.project) | Where-Object { $_ }
 }
 
-function Invoke-Sync($config, [switch]$Quiet, [switch]$Resort, [switch]$Push) {
+function Invoke-Sync($config, [switch]$Quiet, [switch]$Resort, [switch]$Push, [switch]$NoSummaries) {
     if (-not (Test-Configured)) { return 0 }
     $result = Invoke-WithLock $config {
         $index = Read-State $config 'index'
@@ -668,6 +687,18 @@ function Invoke-Sync($config, [switch]$Quiet, [switch]$Resort, [switch]$Push) {
         $ignored = Read-State $config 'ignored'
         $touched = [Collections.Generic.HashSet[string]]::new()
         $count = 0
+        # 1.4.0 moved memory files out of the projects into _Memory\<Agent>\
+        foreach ($id in @($index.Keys | Where-Object { $index[$_].kind -eq 'memory' -and -not $index[$_].file.StartsWith("$MemoryRoot\") })) {
+            $e = $index[$id]
+            $rel = Get-MemoryRel ([pscustomobject]@{ Id = $id; SourcePath = $e.sourcePath }) $index $(if ($e.agent) { $e.agent } else { 'claude' })
+            $from = Join-Path $config.ContextDir $e.file
+            if (Test-Path -LiteralPath $from) {
+                New-Item -ItemType Directory -Force (Split-Path (Join-Path $config.ContextDir $rel) -Parent) | Out-Null
+                Move-Item -LiteralPath $from (Join-Path $config.ContextDir $rel) -Force
+            }
+            $e.file = $rel
+            [void]$touched.Add($e.project)
+        }
         foreach ($cs in $ContextSources.Values) {
             try { $sources = @(& $cs.GetSources) } catch { if (-not $Quiet) { Write-Warn "$($cs.Label): couldn't list sources: $_" }; continue }
             $cache = @{}
@@ -726,13 +757,18 @@ function Invoke-Sync($config, [switch]$Quiet, [switch]$Resort, [switch]$Push) {
     }
     if ($null -eq $result) { if (-not $Quiet) { Write-Warn 'Another sync is already running.' }; return 0 }
     if (-not $Quiet) { Write-Ok "Synced: $($result.Count) new or updated item(s)." }
-    Update-Summaries $config $result.Touched -Quiet:$Quiet
+    if (-not $NoSummaries) { Update-Summaries $config $result.Touched -Quiet:$Quiet }
     Invoke-PluginRefresh $config -Quiet:$Quiet
     if (($Push -or $config.AutoPush) -and $config.Repo) { Push-Context $config -Quiet:$Quiet }
     $result.Count
 }
 
 function Remove-EmptyProjects($config) {
+    $mem = Join-Path $config.ContextDir $MemoryRoot
+    if (Test-Path -LiteralPath $mem) {
+        Get-ChildItem -LiteralPath $mem -Directory | Where-Object { -not (Get-ChildItem -LiteralPath $_.FullName -Force) } | Remove-Item
+        if (-not (Get-ChildItem -LiteralPath $mem -Force)) { Remove-Item -LiteralPath $mem }
+    }
     foreach ($name in Get-ProjectNames $config) {
         $dir = Join-Path $config.ContextDir $name
         Get-ChildItem -LiteralPath $dir -Directory -Recurse | Sort-Object { $_.FullName.Length } -Descending |
@@ -749,6 +785,7 @@ function Remove-EmptyProjects($config) {
 # Moves an item's Markdown file to another project folder and fixes its frontmatter
 function Move-IndexedFile($index, $id, $project, $config) {
     $e = $index[$id]
+    if ($e.kind -eq 'memory') { $e.project = $project; return }      # memory files stay in _Memory; only the link changes
     $from = Join-Path $config.ContextDir $e.file
     $rel = Join-Path (Get-SafeName $project) ($e.file.Substring($e.file.IndexOf('\') + 1))
     $to = Join-Path $config.ContextDir $rel
@@ -835,6 +872,7 @@ function Rename-ContextProject($config, $old, $new) {
             $e = $index[$id]
             if ($e.project -ne $old) { continue }
             $e.project = $new
+            if ($e.kind -eq 'memory') { continue }
             $e.file = Join-Path (Get-SafeName $new) ($e.file.Substring($e.file.IndexOf('\') + 1))
             $f = Join-Path $config.ContextDir $e.file
             if ($e.kind -ne 'memory' -and (Test-Path -LiteralPath $f)) {

@@ -57,7 +57,15 @@ function Show-Menu([string[]]$Rows, [string]$Label, [string]$Header, [string[]]$
     @{ Key = $key; Row = if ($row) { ($row -split "`t")[1] } else { '' } }
 }
 
+# Throws away keys pressed (or terminal replies received) while something was running, so a question
+# never answers itself with leftover input
+function Clear-PendingInput {
+    if ([Console]::IsInputRedirected) { return }
+    try { while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) } } catch {}
+}
+
 function Read-Value($label, $default = '') {
+    Clear-PendingInput
     $hint = if ($default) { " $dim[$default]$reset" } else { '' }
     Write-Host -NoNewline "  $green$label$reset$hint$green >$reset "
     $value = [Console]::ReadLine()
@@ -65,7 +73,16 @@ function Read-Value($label, $default = '') {
     if ($value) { $value } else { $default }
 }
 
-function Read-YesNo($question, [bool]$default = $true) {
+# -Required: no default, Enter alone asks again (for choices that do something outside this PC)
+function Read-YesNo($question, [bool]$default = $true, [switch]$Required) {
+    if ($Required) {
+        if ([Console]::IsInputRedirected) { $a = Read-Value "$question (y/n)"; return $a -match '^y' }
+        while ($true) {
+            $a = Read-Value "$question (y/n)"
+            if ($a -match '^[yn]') { return $a -match '^y' }
+            Write-Host "  ${dim}Type y or n.$reset"
+        }
+    }
     $hint = if ($default) { 'Y/n' } else { 'y/N' }
     $answer = Read-Value "$question ($hint)"
     if (-not $answer) { return $default }

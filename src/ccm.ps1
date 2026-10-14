@@ -8,6 +8,7 @@
 #   ccm import <path>   import a claude.ai data export (.zip or folder) - Claude Desktop chats
 #   ccm open            open the Context folder in Explorer
 #   ccm search [words]  search all your context   (--project=<name> to search one project)
+#   ccm memory          browse memory files by agent
 #   ccm summary <project>   write the project's "where we left off" summary now (--all: every project)
 #   ccm cleanup [project ...]   archive old/tiny sessions and shrink transcripts (no project: pick them)
 #   ccm plugins         browse plugins (e.g. Codex) and install them
@@ -81,13 +82,17 @@ function Invoke-Setup {
     } else { Uninstall-SyncTask }
 
     Write-Host "`n  ${dim}Collecting context...$reset"
-    Invoke-Sync $config | Out-Null
+    Invoke-Sync $config -NoSummaries | Out-Null      # summaries are written after the questions, in the background
 
     Write-Host ''
     Write-Info 'Your context can be backed up to a private GitHub repo (needs the GitHub CLI, gh).'
     Write-Info 'It holds your Claude conversations, so it is always created private.'
-    if (Read-YesNo 'Create a private GitHub repo for your context?' $true) { Set-Repo $config }
+    if (Read-YesNo 'Create a private GitHub repo for your context?' -Required) { Set-Repo $config }
 
+    if ($config.Summaries -eq 'auto') {
+        Write-Info "Writing each project's 'where we left off' summary in the background (they show up in PROJECT.md as they finish)."
+        Start-Process (Get-Process -Id $PID).Path -WindowStyle Hidden -ArgumentList '-NoProfile', '-File', "`"$PSCommandPath`"", 'summary', '--all', '--quiet'
+    }
     Write-Host "`n  ${green}All set.$reset Type ${bright}ClaudeContextManager$reset (or ${bright}ccm$reset) any time to open the menu."
     Write-Info "Claude Desktop chats (not Code sessions) are stored on claude.ai: export them in Claude > Settings >"
     Write-Info "Privacy > Export data, then use Settings > Import in the menu (or: ccm import <zip>)."
@@ -117,7 +122,7 @@ function Get-ProjectStats($config) {
     $stats = @{}
     foreach ($e in $index.Values) {
         $s = $stats[$e.project] ??= @{ Sessions = 0; Memory = 0; Last = '' }
-        if ($e.kind -eq 'memory') { $s.Memory++ } else { $s.Sessions++ }
+        if ($e.kind -eq 'memory') { if ($e.project -ne $Unsorted) { $s.Memory++ } } else { $s.Sessions++ }
         if ($e.updated -gt $s.Last) { $s.Last = $e.updated }
     }
     foreach ($name in Get-ProjectNames $config) { if (-not $stats.Contains($name)) { $stats[$name] = @{ Sessions = 0; Memory = 0; Last = '' } } }
@@ -178,7 +183,7 @@ function Show-ProjectMenu($config, $project) {
             $rows += "$green◆$reset $label`tfile:$($f.RelPath)`t$($f.FullName)"
         }
         $items = @($index.GetEnumerator() | Where-Object { $_.Value.project -eq $project })
-        foreach ($m in $items | Where-Object { $_.Value.kind -eq 'memory' } | Sort-Object { $_.Value.title }) {
+        foreach ($m in $items | Where-Object { $_.Value.kind -eq 'memory' -and $project -ne $Unsorted } | Sort-Object { $_.Value.title }) {
             $rows += "$green✎$reset {0,-46} ${dim}memory$reset`t{1}`t{2}" -f (Get-OneLine $m.Value.title 46), $m.Key, (Join-Path $config.ContextDir $m.Value.file)
         }
         foreach ($s in $items | Where-Object { $_.Value.kind -ne 'memory' } | Sort-Object { $_.Value.updated } -Descending) {
@@ -221,6 +226,57 @@ function Show-ProjectMenu($config, $project) {
                 if ($id -like 'file:*') { break }
                 Clear-Host
                 if (Read-YesNo "Remove `"$($index[$id].title)`" from the Context folder? It won't be imported again." $false) { Remove-ContextItem $config $id }
+            }
+            default { Open-File $path }
+        }
+    }
+}
+
+# Memory -> <agent> -> files. Each file is linked to a project (Ctrl+V changes it); "general" = not about one project.
+function Show-MemoryMenu($config) {
+    while ($true) {
+        $index = Read-State $config 'index'
+        $mem = @($index.GetEnumerator() | Where-Object { $_.Value.kind -eq 'memory' })
+        if (-not $mem) { Clear-Host; Write-Info 'No memory files yet. Claude saves them as it learns about you and your projects.'; Start-Sleep 2; return }
+        $groups = $mem | Group-Object { Get-AgentLabel $_.Value } | Sort-Object { $_.Name -ne 'Claude' }, Name
+        $rows = foreach ($g in $groups) {
+            $folder = Join-Path $config.ContextDir (Join-Path $MemoryRoot (Get-SafeName $g.Name))
+            "{0,-14} $dim{1,3} file(s)$reset`t{0}`t{2}" -f $g.Name, $g.Count, $folder
+        }
+        $pick = Show-Menu @($rows) 'Memory' 'Enter open  ·  Esc back'
+        if (-not $pick -or -not $pick.Row) { return }
+        Show-AgentMemory $config $pick.Row
+    }
+}
+
+function Show-AgentMemory($config, [string]$agentLabel) {
+    while ($true) {
+        $index = Read-State $config 'index'
+        $mem = @($index.GetEnumerator() | Where-Object { $_.Value.kind -eq 'memory' -and (Get-AgentLabel $_.Value) -eq $agentLabel } | Sort-Object { $_.Value.title })
+        if (-not $mem) { return }
+        $rows = foreach ($m in $mem) {
+            $e = $m.Value
+            $proj = if ($e.project -eq $Unsorted) { "${dim}general$reset" } else { $e.project }
+            $pin = if ($e.auto) { ' ' } else { "$green•$reset" }
+            "$green✎$reset$pin{0,-40} $dim{1}$reset  {2}`t{3}`t{4}" -f (Get-OneLine $e.title 40), $e.updated.Substring(0, 10), $proj, $m.Key, (Join-Path $config.ContextDir $e.file)
+        }
+        $header = "Enter open  ·  Ctrl+V link to a project  ·  Ctrl+Y copy  ·  Ctrl+D remove  ·  Ctrl+O folder  ·  Esc back`n" +
+            "${dim}Each memory is linked to the project it's about (general = none); it's included in that project's context.$reset"
+        $pick = Show-Menu @($rows) "Memory · $agentLabel" $header -Expect 'ctrl-v', 'ctrl-y', 'ctrl-d', 'ctrl-o' -Preview
+        if (-not $pick) { return }
+        if ($pick.Key -eq 'ctrl-o') { Start-Process explorer.exe (Join-Path $config.ContextDir (Join-Path $MemoryRoot (Get-SafeName $agentLabel))); continue }
+        if (-not $pick.Row) { continue }
+        $id = $pick.Row
+        $path = Join-Path $config.ContextDir $index[$id].file
+        switch ($pick.Key) {
+            'ctrl-v' {
+                $to = Select-Project $config "Link `"$($index[$id].title)`" to" ''
+                if ($to) { Move-ContextItem $config $id $to }
+            }
+            'ctrl-y' { Set-Clipboard -Value (Get-Content -LiteralPath $path -Raw); Write-Ok 'Copied to the clipboard.'; Start-Sleep -Milliseconds 700 }
+            'ctrl-d' {
+                Clear-Host
+                if (Read-YesNo "Remove `"$($index[$id].title)`" from the Context folder? (Claude keeps its own copy; it won't be imported again.)" $false) { Remove-ContextItem $config $id }
             }
             default { Open-File $path }
         }
@@ -449,7 +505,7 @@ function Show-MainMenu {
         $stats = Get-ProjectStats $config
         $rows = @("$green↻ Sync now$reset`t+sync")
         if ($config.Repo) { $rows += "$green↑ Push to GitHub$reset $dim$($config.Repo)$reset`t+push" }
-        $rows += "$green/ Search$reset`t+search", "$green+ New project$reset`t+new", "$green⧉ Plugins$reset`t+plugins", "$green≡ Settings$reset`t+settings"
+        $rows += "$green/ Search$reset`t+search", "$green✎ Memory$reset`t+memory", "$green+ New project$reset`t+new", "$green⧉ Plugins$reset`t+plugins", "$green≡ Settings$reset`t+settings"
         # most recently active first, Unsorted and _Global last
         $names = $stats.Keys | Sort-Object @{ e = { $_ -in $Unsorted, $Global } }, @{ e = { $stats[$_].Last }; Descending = $true }
         foreach ($name in $names) {
@@ -489,6 +545,7 @@ function Show-MainMenu {
             '+settings' { Show-SettingsMenu }
             '+plugins' { Show-PluginsMenu }
             '+search' { Show-Search $config }
+            '+memory' { Show-MemoryMenu $config }
             default { Show-ProjectMenu $config $row }
         }
     }
@@ -514,10 +571,10 @@ function Uninstall-Ccm {
     Write-Info "Delete $(Join-Path $env:LOCALAPPDATA 'ClaudeContextManager') and $AppDataDir to remove the program files and settings."
 }
 
-if (-not $fzf -and $Command -in 'menu', 'plugins', 'search', 'cleanup') { Write-Warn 'The menus need fzf: winget install junegunn.fzf (then open a new terminal).'; exit 1 }
+if (-not $fzf -and $Command -in 'menu', 'plugins', 'search', 'cleanup', 'memory') { Write-Warn 'The menus need fzf: winget install junegunn.fzf (then open a new terminal).'; exit 1 }
 
 # Commands that work on the Context folder need setup first (the menu runs setup itself)
-if (-not (Test-Configured) -and ($Command -in 'push', 'import', 'open', 'search', 'summary', 'cleanup' -or $PluginCommands.Contains($Command))) {
+if (-not (Test-Configured) -and ($Command -in 'push', 'import', 'open', 'search', 'summary', 'cleanup', 'memory' -or $PluginCommands.Contains($Command))) {
     if ($Command -eq 'olive' -and $params -and $params[0] -eq 'hook') { exit 0 }     # hooks stay silent
     Write-Warn "ClaudeContextManager isn't set up yet. Run: ClaudeContextManager setup"
     exit 1
@@ -538,6 +595,7 @@ switch ($Command) {
     'open' { Start-Process explorer.exe (Get-Config).ContextDir }
     'plugins' { Show-PluginsMenu }
     'search' { Show-Search (Get-Config) (Get-FlagValue $flags 'project') ($params -join ' ') }
+    'memory' { Show-MemoryMenu (Get-Config) }
     'summary' {
         $config = Get-Config
         $targets = if ('--all' -in $flags) { @((Get-ProjectStats $config).Keys | Where-Object { $_ -notin $Unsorted, $Global }) } else { @($params -join ' ') | Where-Object { $_ } }
@@ -582,7 +640,7 @@ switch ($Command) {
     'uninstall' { Uninstall-Ccm }
     default {
         if ($PluginCommands.Contains($Command)) { & $PluginCommands[$Command].Action $params $flags; break }
-        Get-Content $PSCommandPath | Select-Object -Skip 2 -First 14 | ForEach-Object { $_.TrimStart('#') }
+        Get-Content $PSCommandPath | Select-Object -Skip 2 -First 15 | ForEach-Object { $_.TrimStart('#') }
         foreach ($c in $PluginCommands.Values) { Write-Host "   $($c.Usage)" }
     }
 }

@@ -36,6 +36,8 @@ Setup asks:
 | `ccm plugins` | browse and install plugins (`plugin install/update/remove/list <name>`) |
 | `ccm uninstall` | remove hook, task and command (keeps your context) |
 
+**Memory:** `✎ Memory` in the main menu (or `ccm memory`) lists memory files by agent: Memory → Claude → files. Memory files live in `Context\_Memory\<Agent>\`, each linked to the project it's about (shown in the list; "general" means none). Linked memory is part of that project's context (PROJECT.md, Ctrl+Y, summaries); Ctrl+V links it to another project.
+
 **Main menu:** Enter open project · Ctrl+S sync · Ctrl+F search · Ctrl+N new project · Ctrl+R rename/merge · Ctrl+Y copy the project's Claude context to paste into Claude · Ctrl+W write summary · Ctrl+K clean up · Ctrl+O open folder
 
 **Project menu:** Enter open file · Ctrl+V move to another project · Ctrl+R resume the session · Ctrl+F search this project · Ctrl+W write summary · Ctrl+K clean up · Ctrl+Y copy · Ctrl+D remove (never re-imported) · Ctrl+P plugin actions · Ctrl+O folder
@@ -71,10 +73,10 @@ Context/
     SUMMARY.md                  the "where we left off" summary
     GIT.md                      recent commits of the project's repos
     CLAUDE.md                   copied from the project folder
-    memory/*.md                 Claude memory files about the project
     sessions/<date>_<title>_<id>.md   one Markdown transcript per session/chat
     claude-ai-project/          claude.ai Project instructions + knowledge (from an export)
   Unsorted/                     context that didn't clearly match a project
+  _Memory/<Agent>/*.md          memory files, each linked to a project
   _Global/CLAUDE.md             your ~/.claude/CLAUDE.md
   .ccm/                         index, manual sorting, project rules
 ```
