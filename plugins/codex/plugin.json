@@ -1,0 +1,7 @@
+{
+  "name": "codex",
+  "version": "1.0.0",
+  "description": "Adds OpenAI Codex CLI sessions and AGENTS.md files, sorted by project in a separate codex folder",
+  "author": "ItsOverk1ll",
+  "minCcmVersion": "1.1.0"
+}
