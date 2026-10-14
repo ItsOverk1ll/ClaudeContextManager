@@ -30,6 +30,14 @@ if ($Command -eq 'sync' -and '--background' -in $flags) {
 
 . (Join-Path $PSScriptRoot 'ui-lib.ps1')
 
+# "~\Context" or "%USERPROFILE%\Context" -> a full path (relative paths are taken from your home folder)
+function Resolve-UserPath([string]$path) {
+    $p = [Environment]::ExpandEnvironmentVariables($path.Trim().Trim('"'))
+    if ($p -match '^~([\\/]|$)') { $p = $HOME + $p.Substring(1) }
+    if (-not [IO.Path]::IsPathRooted($p)) { $p = Join-Path $HOME $p }
+    [IO.Path]::GetFullPath($p)
+}
+
 function Get-Editor {
     if ($env:CCM_EDITOR) { return $env:CCM_EDITOR }
     foreach ($e in 'code', 'notepad++') { if (Get-Command $e -ErrorAction SilentlyContinue) { return $e } }
@@ -51,7 +59,7 @@ function Invoke-Setup {
     Write-Info 'CLAUDE.md files, and sorts it into one folder per project.'
     Write-Host ''
 
-    $config.ContextDir = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables((Read-Value 'Context folder' $config.ContextDir)))
+    $config.ContextDir = Resolve-UserPath (Read-Value 'Context folder' $config.ContextDir)
     $config.AutoSort = Read-YesNo 'Sort context into projects automatically?' $true
     if (-not $config.AutoSort) { Write-Info "New context will go to $Unsorted for you to sort from the menu (Ctrl+V)." }
     $config.Redact = Read-YesNo 'Redact API keys, tokens and passwords in saved context?' $true
@@ -233,6 +241,11 @@ function Show-Search($config, [string]$project = '', [string]$query = '') {
     $root = $config.ContextDir
     $scope = if ($project) { "`"$(Get-SafeName $project)`"" } else { '.' }
     $rg = Get-Command rg -ErrorAction SilentlyContinue
+    if (-not $rg) {
+        # just installed by winget: on the PATH only for terminals opened since, so look where winget puts it
+        $rgExe = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\BurntSushi.ripgrep*\*\rg.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($rgExe) { $env:Path = "$($rgExe.DirectoryName);$env:Path"; $rg = $rgExe }
+    }
     $mdFiles = if ($project) { '"' + (Get-SafeName $project) + '\*.md"' } else { '*.md' }
     $find = if ($rg) { "rg --line-number --no-heading --color=always --smart-case --fixed-strings --max-columns=300 --max-columns-preview -g *.md -- {q} $scope" }
         else { "findstr /s /i /n /p /c:{q} $mdFiles" }
@@ -386,8 +399,7 @@ function Show-SettingsMenu {
             'task' { try { if ($task) { Uninstall-SyncTask } else { Install-SyncTask } } catch { Write-Warn "$_"; Wait-Key } }
             'repo' { Set-Repo $config; Wait-Key }
             'dir' {
-                $new = Read-Value 'Context folder' $config.ContextDir
-                $new = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($new))
+                $new = Resolve-UserPath (Read-Value 'Context folder' $config.ContextDir)
                 if ($new -ne $config.ContextDir) {
                     if ((Test-Path $config.ContextDir) -and -not (Test-Path $new) -and (Read-YesNo "Move the existing Context folder to $new?" $true)) {
                         Move-Item -LiteralPath $config.ContextDir $new
@@ -487,6 +499,12 @@ function Show-MainMenu {
 function Uninstall-Ccm {
     Uninstall-SyncHook
     Uninstall-SyncTask
+    # plugins' own hooks and skills point at this program, so take them out too (the plugin files stay)
+    $config = Get-Config
+    foreach ($name in @($PluginLifecycle.Keys)) {
+        $u = $PluginLifecycle[$name].OnUninstall
+        if ($u) { try { & $u $config } catch { Write-Warn "Plugin ${name}: $_" } }
+    }
     $bin = Join-Path $env:LOCALAPPDATA 'ClaudeContextManager\bin'
     $path = [Environment]::GetEnvironmentVariable('Path', 'User')
     $newPath = ($path -split ';' | Where-Object { $_ -and $_.TrimEnd('\') -ne $bin }) -join ';'
@@ -496,7 +514,14 @@ function Uninstall-Ccm {
     Write-Info "Delete $(Join-Path $env:LOCALAPPDATA 'ClaudeContextManager') and $AppDataDir to remove the program files and settings."
 }
 
-if (-not $fzf -and $Command -eq 'menu') { Write-Warn 'fzf is required for the menu: winget install junegunn.fzf'; exit 1 }
+if (-not $fzf -and $Command -in 'menu', 'plugins', 'search', 'cleanup') { Write-Warn 'The menus need fzf: winget install junegunn.fzf (then open a new terminal).'; exit 1 }
+
+# Commands that work on the Context folder need setup first (the menu runs setup itself)
+if (-not (Test-Configured) -and ($Command -in 'push', 'import', 'open', 'search', 'summary', 'cleanup' -or $PluginCommands.Contains($Command))) {
+    if ($Command -eq 'olive' -and $params -and $params[0] -eq 'hook') { exit 0 }     # hooks stay silent
+    Write-Warn "ClaudeContextManager isn't set up yet. Run: ClaudeContextManager setup"
+    exit 1
+}
 
 switch ($Command) {
     'menu' { Show-MainMenu }

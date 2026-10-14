@@ -82,7 +82,8 @@ function Invoke-ClaudeHeadless([string]$prompt, [string]$stdin, [string]$model, 
     $psi.RedirectStandardInput = $psi.RedirectStandardOutput = $psi.RedirectStandardError = $true
     $psi.UseShellExecute = $false
     $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
-    foreach ($k in @($psi.Environment.Keys | Where-Object { $_ -like 'CLAUDE*' })) { [void]$psi.Environment.Remove($k) }
+    # drop the variables that mark "running inside a Claude session" (keep CLAUDE_CONFIG_DIR: it says where you're signed in)
+    foreach ($k in @($psi.Environment.Keys | Where-Object { $_ -like 'CLAUDE*' -and $_ -ne 'CLAUDE_CONFIG_DIR' })) { [void]$psi.Environment.Remove($k) }
     $psi.Environment['CCM_SUMMARIZING'] = '1'
     $proc = [Diagnostics.Process]::Start($psi)
     $out = $proc.StandardOutput.ReadToEndAsync()
@@ -113,7 +114,7 @@ function Update-ProjectSummary($config, [string]$project) {
     $state = Read-State $config 'summaries'
     $state[$project] = [ordered]@{ written = (Get-Date).ToString('yyyy-MM-dd HH:mm'); latestSession = $latest }
     Write-State $config 'summaries' $state
-    Invoke-WithLock $config { Write-ProjectIndex $project (Read-State $config 'index') (Read-State $config 'projects') $config } | Out-Null
+    Invoke-WithLock $config { Write-ProjectIndex $project (Read-State $config 'index') (Read-State $config 'projects') $config } -WaitSeconds 60 | Out-Null
 }
 
 # After a sync: refresh summaries of projects with new Claude sessions (if Summaries = auto), at most every
@@ -160,7 +161,7 @@ function Get-CleanupPlan($config, [string[]]$projects, [hashtable]$options) {
 }
 
 # Drops the one-line tool-call summaries from a transcript, keeping prompts and replies
-function Get-CompactTranscript([string]$text) { $text -replace '(?m)^- \*[^*\r\n]+\*( `[^\r\n]*`)?\r?\n', '' }
+function Get-CompactTranscript([string]$text) { $text -replace '(?m)^- \*[^*\s]+\*( `[^\r\n]*`)?\r?\n', '' }
 
 function Invoke-Cleanup($config, [string[]]$projects, [hashtable]$options) {
     $plan = Get-CleanupPlan $config $projects $options
@@ -199,7 +200,7 @@ function Invoke-Cleanup($config, [string[]]$projects, [hashtable]$options) {
         Remove-EmptyProjects $config
         Write-ContextReadme $index $config
         [pscustomobject]@{ Removed = $plan.Remove.Count; RemovedBytes = $plan.RemoveBytes; Compacted = $plan.Compact.Count; CompactBytes = $saved; Archive = $(if ($plan.Remove.Count -and $options.Archive) { $lastArchive }) }
-    }
+    } -WaitSeconds 60
     if ($null -eq $result) { throw 'A sync is running; try again in a moment.' }
     $result
 }

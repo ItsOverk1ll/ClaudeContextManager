@@ -4,6 +4,9 @@
 [Console]::OutputEncoding = $OutputEncoding = [Text.UTF8Encoding]::new($false)   # no BOM, or fzf's first row breaks
 $PSStyle.OutputRendering = 'Ansi'   # otherwise PowerShell strips the colors from rows piped to fzf
 
+# Clear-Host fails when there's no real console window (piped or scripted runs); only clear when there is one
+function Clear-Host { if (-not [Console]::IsOutputRedirected) { try { [Console]::Clear() } catch {} } }
+
 $script:esc = [char]27
 $script:reset = "$esc[0m"
 
@@ -40,6 +43,7 @@ $script:fzfStyle = @('--ansi', '--layout=reverse', '--gutter= ', '--border=round
 
 # Shows rows ("display`tkey`tpreview-file") in fzf. Returns @{ Key = <pressed key or ''>; Row = <key field> }, or $null on Esc.
 function Show-Menu([string[]]$Rows, [string]$Label, [string]$Header, [string[]]$Expect = @(), [switch]$Preview) {
+    if (-not $fzf) { throw 'The menus need fzf: winget install junegunn.fzf (then open a new terminal).' }
     $fzfArgs = @($fzfStyle) + @("--border-label= $Label ", "--header=$Header")
     if ($Expect) { $fzfArgs += "--expect=$($Expect -join ',')" }
     if ($Preview) {
@@ -72,4 +76,7 @@ function Write-Info($text) { Write-Host "  $dim$text$reset" }
 function Write-Ok($text) { Write-Host "  $green$text$reset" }
 function Write-Warn($text) { Write-Host "  $warn$text$reset" }
 
-function Wait-Key { Write-Host "`n  ${dim}Press any key...$reset"; [void][Console]::ReadKey($true) }
+function Wait-Key {
+    if ([Console]::IsInputRedirected) { return }      # not at a keyboard (piped or scripted)
+    Write-Host "`n  ${dim}Press any key...$reset"; [void][Console]::ReadKey($true)
+}

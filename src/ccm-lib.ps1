@@ -23,7 +23,7 @@ $script:ClaudeDir = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else 
 $script:DesktopDir = Join-Path $env:APPDATA 'Claude'
 $script:Unsorted = 'Unsorted'
 $script:Global = '_Global'
-$script:CcmVersion = '1.3.0'
+$script:CcmVersion = '1.3.1'
 $script:PluginDir = Join-Path (Split-Path $ConfigFile -Parent) 'plugins'
 $script:ContextSources = [ordered]@{}
 
@@ -35,10 +35,14 @@ $script:ContextSources = [ordered]@{}
 #   Read       { param($src, $cache) -> item (see Read-Session); $cache is a hashtable kept for one sync }
 #   CopyDocs   { param($projects, $config) } optional: copy per-project docs (CLAUDE.md, AGENTS.md...)
 #   Resume     { param($id, $entry) } optional: reopen a session (runs in the session's folder)
+#   AgentHome  optional: the agent's own config folder (e.g. ~/.codex); tells bridges like OliveBranch the agent is used here
+#   SkillsDir  optional: where the agent loads user skills from
+$script:LoadingPlugin = $null       # set while a plugin's plugin.ps1 runs, so its registrations are tied to it
 function Register-ContextSource([hashtable]$source) {
     if (-not $source.Name -or -not $source.GetSources -or -not $source.Read) { throw 'Register-ContextSource needs Name, GetSources and Read' }
     if (-not $source.Contains('Label')) { $source.Label = $source.Name }
     if (-not $source.Contains('Folder')) { $source.Folder = '' }
+    $source.Plugin = $script:LoadingPlugin
     $script:ContextSources[$source.Name] = $source
 }
 
@@ -58,10 +62,24 @@ function Register-ProjectAction([scriptblock]$Label, [scriptblock]$Run) {
     $script:ProjectActions.Add(@{ Label = $Label; Run = $Run })
 }
 
-# OnInstall / OnUninstall: { param($config) }
-function Register-PluginLifecycle([string]$Name, [scriptblock]$OnInstall, [scriptblock]$OnUninstall) {
-    $script:PluginLifecycle[$Name] = @{ OnInstall = $OnInstall; OnUninstall = $OnUninstall }
+# OnInstall / OnUninstall: { param($config) }. OnRefresh: { param($config) }, run after every sync and whenever
+# a plugin is installed or removed (so a plugin can react to which agents are available).
+function Register-PluginLifecycle([string]$Name, [scriptblock]$OnInstall, [scriptblock]$OnUninstall, [scriptblock]$OnRefresh) {
+    $script:PluginLifecycle[$Name] = @{ OnInstall = $OnInstall; OnUninstall = $OnUninstall; OnRefresh = $OnRefresh }
 }
+
+function Invoke-PluginRefresh($config, [switch]$Quiet) {
+    if ($env:CCM_SUMMARIZING) { return }
+    foreach ($name in @($PluginLifecycle.Keys)) {
+        $r = $PluginLifecycle[$name].OnRefresh
+        if (-not $r) { continue }
+        try { & $r $config } catch { if (-not $Quiet) { Write-Host "  Plugin ${name}: $_" } }
+    }
+}
+
+# State files in .ccm keyed by project name; renaming a project renames its entries in them
+$script:ProjectStateFiles = [Collections.Generic.List[string]]@('summaries', 'git')
+function Register-ProjectState([string]$Name) { if ($Name -notin $ProjectStateFiles) { $script:ProjectStateFiles.Add($Name) } }
 
 function Get-FlagValue([string[]]$flags, [string]$name) {
     foreach ($f in $flags) { if ($f -match "^--$name=(.*)$") { return $Matches[1].Trim('"') } }
@@ -109,6 +127,11 @@ function Save-Config($config) {
 
 function Test-Configured { Test-Path $ConfigFile }
 
+# Nothing may create or change a Context folder before setup has saved where it goes
+function Assert-Configured {
+    if (-not (Test-Configured)) { throw "ClaudeContextManager isn't set up yet. Run: ClaudeContextManager setup" }
+}
+
 function Get-StateDir($config) { Join-Path $config.ContextDir '.ccm' }
 
 function Read-State($config, $name) {
@@ -121,6 +144,7 @@ function Read-State($config, $name) {
 }
 
 function Write-State($config, $name, $data) {
+    Assert-Configured
     $dir = Get-StateDir $config
     New-Item -ItemType Directory -Force $dir | Out-Null
     # Sorted keys keep the git diffs of the Context repo small
@@ -348,9 +372,10 @@ function ConvertTo-WindowsPath([string]$path) {
 # Which project folder does a path belong to? Git repo root first, otherwise the first folder under the
 # user's home (or under a container folder like Documents). Cached, because sessions repeat paths a lot.
 function Get-ProjectRoot([string]$path, $config) {
-    $p = ConvertTo-WindowsPath $path
+    try { $p = ConvertTo-WindowsPath $path } catch { return $null }
     if ($RootCache.ContainsKey($p)) { return $RootCache[$p] }
     $root = $null
+    try {
     $home_ = $HOME.TrimEnd('\')
     $isUnderHome = $p.StartsWith("$home_\", [StringComparison]::OrdinalIgnoreCase)
     $ctx = $config.ContextDir.TrimEnd('\')
@@ -379,6 +404,7 @@ function Get-ProjectRoot([string]$path, $config) {
         }
         if ($root -and ($config.GenericDirs | Where-Object { $_ -and $_.TrimEnd('\') -ieq $root.TrimEnd('\') })) { $root = $null }
     }
+    } catch { $root = $null }       # a path Windows can't parse (odd characters picked up from a transcript)
     $RootCache[$p] = $root
     $root
 }
@@ -597,11 +623,20 @@ function New-IndexEntry($item, $project, $rel, $source, [bool]$auto, [string]$ag
         prompts = $item.Prompts; sourcePath = $item.SourcePath; mtime = $source.Mtime; size = $source.Size }
 }
 
-function Invoke-WithLock($config, [scriptblock]$action) {
+# Runs $action holding .ccm\sync.lock. Syncs skip when it's taken (-WaitSeconds 0); changes you make in the
+# menu wait for a running sync to finish instead of silently doing nothing.
+function Invoke-WithLock($config, [scriptblock]$action, [int]$WaitSeconds = 0) {
+    Assert-Configured
     $dir = Get-StateDir $config
     New-Item -ItemType Directory -Force $dir | Out-Null
-    try { $lock = [IO.File]::Open((Join-Path $dir 'sync.lock'), 'OpenOrCreate', 'ReadWrite', 'None') }
-    catch { return $null }   # another sync is running
+    $deadline = (Get-Date).AddSeconds($WaitSeconds)
+    while ($true) {
+        try { $lock = [IO.File]::Open((Join-Path $dir 'sync.lock'), 'OpenOrCreate', 'ReadWrite', 'None'); break }
+        catch {
+            if ((Get-Date) -ge $deadline) { if ($WaitSeconds) { throw 'A sync is still running; try again in a moment.' }; return $null }
+            Start-Sleep -Milliseconds 250
+        }
+    }
     try { & $action } finally { $lock.Dispose() }
 }
 
@@ -625,6 +660,7 @@ function Save-ContextItem($item, $source, $index, $overrides, $projects, $config
 }
 
 function Invoke-Sync($config, [switch]$Quiet, [switch]$Resort, [switch]$Push) {
+    if (-not (Test-Configured)) { return 0 }
     $result = Invoke-WithLock $config {
         $index = Read-State $config 'index'
         $overrides = Read-State $config 'overrides'
@@ -669,9 +705,15 @@ function Invoke-Sync($config, [switch]$Quiet, [switch]$Resort, [switch]$Push) {
             }
         }
         if (-not $Quiet) { Write-Progress -Activity 'Syncing context' -Completed }
+        # instruction files (CLAUDE.md, AGENTS.md...) only for projects that have context, so a repo a session
+        # merely looked at doesn't get a folder of its own
+        $withContext = @{}
+        foreach ($e in $index.Values) { $withContext[$e.project] = $true }
+        $active = [ordered]@{}
+        foreach ($name in $projects.Keys) { if ($withContext.Contains($name)) { $active[$name] = $projects[$name] } }
         foreach ($cs in $ContextSources.Values) {
             if (-not $cs.CopyDocs) { continue }
-            try { & $cs.CopyDocs $projects $config } catch { if (-not $Quiet) { Write-Warn "$($cs.Label) docs: $_" } }
+            try { & $cs.CopyDocs $active $config } catch { if (-not $Quiet) { Write-Warn "$($cs.Label) docs: $_" } }
         }
         Write-State $config 'index' $index
         Write-State $config 'projects' $projects
@@ -685,6 +727,7 @@ function Invoke-Sync($config, [switch]$Quiet, [switch]$Resort, [switch]$Push) {
     if ($null -eq $result) { if (-not $Quiet) { Write-Warn 'Another sync is already running.' }; return 0 }
     if (-not $Quiet) { Write-Ok "Synced: $($result.Count) new or updated item(s)." }
     Update-Summaries $config $result.Touched -Quiet:$Quiet
+    Invoke-PluginRefresh $config -Quiet:$Quiet
     if (($Push -or $config.AutoPush) -and $config.Repo) { Push-Context $config -Quiet:$Quiet }
     $result.Count
 }
@@ -737,7 +780,7 @@ function Move-ContextItem($config, $id, $project) {
         Write-ProjectIndex $project $index $projects $config
         Remove-EmptyProjects $config
         Write-ContextReadme $index $config
-    } | Out-Null
+    } -WaitSeconds 60 | Out-Null
 }
 
 function Remove-ContextItem($config, $id) {
@@ -754,7 +797,7 @@ function Remove-ContextItem($config, $id) {
         Write-ProjectIndex $e.project $index $projects $config
         Remove-EmptyProjects $config
         Write-ContextReadme $index $config
-    } | Out-Null
+    } -WaitSeconds 60 | Out-Null
 }
 
 function New-ContextProject($config, $name, [string[]]$paths = @(), [string[]]$keywords = @()) {
@@ -771,7 +814,14 @@ function Rename-ContextProject($config, $old, $new) {
         $projects = Read-State $config 'projects'
         $from = Join-Path $config.ContextDir (Get-SafeName $old)
         $to = Join-Path $config.ContextDir (Get-SafeName $new)
-        if (Test-Path $to) {
+        if ((Get-SafeName $old) -ieq (Get-SafeName $new)) {
+            # only the capitalization changes: Windows sees one folder, so rename through a temporary name
+            if (Test-Path -LiteralPath $from) {
+                $tmp = "$from.renaming"
+                Rename-Item -LiteralPath $from (Split-Path $tmp -Leaf)
+                Rename-Item -LiteralPath $tmp (Split-Path $to -Leaf)
+            }
+        } elseif (Test-Path -LiteralPath $to) {
             # merge into the existing project
             foreach ($id in @($index.Keys | Where-Object { $index[$_].project -eq $old })) { Move-IndexedFile $index $id $new $config }
             foreach ($d in @(Get-ProjectDocs $from)) {
@@ -805,9 +855,16 @@ function Rename-ContextProject($config, $old, $new) {
         Write-State $config 'index' $index
         Write-State $config 'overrides' $overrides
         Write-State $config 'projects' $projects
+        foreach ($stateName in $ProjectStateFiles) {
+            $st = Read-State $config $stateName
+            if ($st.Contains($old)) {
+                if (-not $st.Contains($new) -or $old -ieq $new) { $v = $st[$old]; $st.Remove($old); $st[$new] = $v } else { $st.Remove($old) }
+                Write-State $config $stateName $st
+            }
+        }
         Write-ProjectIndex $new $index $projects $config
         Write-ContextReadme $index $config
-    } | Out-Null
+    } -WaitSeconds 60 | Out-Null
 }
 
 #endregion
@@ -845,7 +902,10 @@ function Import-ClaudeExport($config, [string]$path) {
             foreach ($c in $conversations) {
                 $id = "web:$($c.uuid)"
                 if ($ignored.Contains($id)) { continue }
+                $created = ConvertTo-DateTime $c.created_at
                 $updated = ConvertTo-DateTime $c.updated_at
+                if (-not $updated) { $updated = if ($created) { $created } else { Get-Date '2000-01-01' } }
+                if (-not $created) { $created = $updated }
                 $src = [pscustomobject]@{ Mtime = $updated.Ticks; Size = @($c.chat_messages).Count }
                 $old = $index[$id]
                 if ($old -and $old.mtime -eq $src.Mtime -and $old.size -eq $src.Size) { continue }
@@ -865,7 +925,7 @@ function Import-ClaudeExport($config, [string]$path) {
                 if ($turns.Count -eq 0) { continue }
                 $title = if ($c.name) { $c.name } else { Get-OneLine $turns[0].Text[0] 60 }
                 $item = [pscustomobject]@{ Id = $id; Kind = 'chat'; SourcePath = ''; Title = $title; Cwd = ''; Branch = ''; Source = 'claude.ai'
-                    Started = (ConvertTo-DateTime $c.created_at); Updated = $updated; Turns = $turns; Hits = $hits
+                    Started = $created; Updated = $updated; Turns = $turns; Hits = $hits
                     UserText = $userText.ToString(); Prompts = @($turns | Where-Object Role -eq 'user').Count }
                 foreach ($p in (Save-ContextItem $item $src $index $overrides $projects $config)) { [void]$touched.Add($p) }
                 $n++
@@ -895,7 +955,7 @@ function Import-ClaudeExport($config, [string]$path) {
             foreach ($p in $touched) { Write-ProjectIndex $p $index $projects $config }
             Write-ContextReadme $index $config
             $n
-        }
+        } -WaitSeconds 60
         $count
     } finally {
         if ($temp) { Remove-Item $temp -Recurse -Force -ErrorAction SilentlyContinue }
@@ -1118,9 +1178,11 @@ function Install-CcmPlugin($config, [string]$nameOrPath) {
     New-Item -ItemType Directory -Force $dest | Out-Null
     Get-ChildItem -LiteralPath $src.Path -Force | Where-Object Name -ne '.git' | Copy-Item -Destination $dest -Recurse -Force
     # load it now so its install step (skills, hooks...) can run
-    . (Join-Path $dest 'plugin.ps1')
+    $script:LoadingPlugin = $src.Name
+    try { . (Join-Path $dest 'plugin.ps1') } finally { $script:LoadingPlugin = $null }
     $life = $PluginLifecycle[$src.Name]
     if ($life -and $life.OnInstall) { & $life.OnInstall $config }
+    Invoke-PluginRefresh $config
     Read-PluginManifest $dest
 }
 
@@ -1131,7 +1193,10 @@ function Uninstall-CcmPlugin($config, [string]$name, [switch]$RemoveContext) {
     $life = $PluginLifecycle[$name]
     if ($life -and $life.OnUninstall) { & $life.OnUninstall $config }
     Remove-Item $dir -Recurse -Force
-    if (-not $RemoveContext) { return }
+    foreach ($k in @($ContextSources.Keys)) { if ($ContextSources[$k].Plugin -eq $name) { $ContextSources.Remove($k) } }
+    $PluginLifecycle.Remove($name)
+    Invoke-PluginRefresh $config
+    if (-not $RemoveContext -or -not (Test-Configured)) { return }
     Invoke-WithLock $config {
         $index = Read-State $config 'index'
         $projects = Read-State $config 'projects'
@@ -1151,7 +1216,7 @@ function Uninstall-CcmPlugin($config, [string]$name, [switch]$RemoveContext) {
         foreach ($p in $touched.Keys) { Write-ProjectIndex $p $index $projects $config }
         Remove-EmptyProjects $config
         Write-ContextReadme $index $config
-    } | Out-Null
+    } -WaitSeconds 60 | Out-Null
 }
 
 # Which project does a folder belong to? Uses the project rules first, then the same detection as auto-sort.
@@ -1177,7 +1242,8 @@ function Find-ProjectForPath($config, [string]$path) {
 function Get-TranscriptDigest([string]$file, [int]$maxChars = 3000) {
     $raw = Get-Content -LiteralPath $file -Raw
     $body = $raw -replace '(?s)^---.*?---\s*', ''
-    $sections = [regex]::Split($body, '(?m)^## ') | Select-Object -Skip 1
+    # turn headings look like "## You · 10-13 06:00"; headings inside replies ("## Next steps") are not turns
+    $sections = [regex]::Split($body, '(?m)^## (?=[A-Z][\w.]* · \d\d-\d\d \d\d:\d\d\r?$)') | Select-Object -Skip 1
     $prompts = @(); $last = ''
     foreach ($sec in $sections) {
         $nl = $sec.IndexOf("`n")
@@ -1216,7 +1282,8 @@ function Get-AgentContext($config, [string]$project, [string[]]$Agents, [int]$Re
             [void]$sb.AppendLine("## $label doc: $($d.RelPath)").AppendLine().AppendLine($t).AppendLine()
         }
         foreach ($m in $entries | Where-Object kind -eq 'memory') {
-            [void]$sb.AppendLine("## $label memory: $($m.title)").AppendLine().AppendLine((Get-Content -LiteralPath (Join-Path $config.ContextDir $m.file) -Raw)).AppendLine()
+            $mf = Join-Path $config.ContextDir $m.file
+            if (Test-Path -LiteralPath $mf) { [void]$sb.AppendLine("## $label memory: $($m.title)").AppendLine().AppendLine((Get-Content -LiteralPath $mf -Raw)).AppendLine() }
         }
         $sessions = @($entries | Where-Object kind -ne 'memory' | Sort-Object { $_.updated } -Descending)
         if ($sessions) {
@@ -1239,7 +1306,9 @@ function Get-AgentContext($config, [string]$project, [string[]]$Agents, [int]$Re
 
 # Load installed plugins (dot-sourced here so their functions and Register-ContextSource calls take effect)
 foreach ($pluginScript in @(Get-ChildItem $PluginDir -Directory -ErrorAction SilentlyContinue | ForEach-Object { Join-Path $_.FullName 'plugin.ps1' } | Where-Object { Test-Path $_ })) {
-    try { . $pluginScript } catch { Write-Host "  Plugin $(Split-Path (Split-Path $pluginScript -Parent) -Leaf) failed to load: $_" }
+    $script:LoadingPlugin = Split-Path (Split-Path $pluginScript -Parent) -Leaf
+    try { . $pluginScript } catch { Write-Host "  Plugin $LoadingPlugin failed to load: $_" }
+    $script:LoadingPlugin = $null
 }
 Remove-Variable pluginScript -ErrorAction SilentlyContinue
 
