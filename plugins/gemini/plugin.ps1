@@ -175,6 +175,7 @@ Register-ContextSource @{
     GetSources = { Get-GeminiSessionSources }
     Read       = { param($src, $cache) Read-GeminiSession $src }
     CopyDocs   = { param($projects, $config) Copy-GeminiMds $projects $config }
+    Launch     = @{ Command = 'gemini'; Args = { param($prompt) @('-i', $prompt) } }   # Ctrl+Enter on a project
     Resume     = {
         param($id, $entry)
         if (-not (Get-Command gemini -ErrorAction SilentlyContinue)) { throw 'The gemini command was not found (npm install -g @google/gemini-cli).' }

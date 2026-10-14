@@ -200,6 +200,7 @@ Register-ContextSource @{
         Read-CodexSession $src $cache.Names
     }
     CopyDocs   = { param($projects, $config) Copy-CodexAgentsMds $projects $config }
+    Launch     = @{ Command = 'codex'; Args = { param($prompt) @($prompt) } }   # Ctrl+Enter on a project
     Resume     = {
         param($id, $entry)
         if (-not (Get-Command codex -ErrorAction SilentlyContinue)) { throw 'The codex command was not found (npm install -g @openai/codex).' }
