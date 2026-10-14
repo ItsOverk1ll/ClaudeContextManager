@@ -1,9 +1,14 @@
 # OliveBranch plugin for ClaudeContextManager: an opt-in bridge that lets one agent read another
-# agent's context for the same project (Claude <-> Codex, or any agents your plugins add).
+# agent's context for the same project (Claude <-> Codex <-> Gemini, whichever you use).
+#
+# It works with any two or more agents: Claude (always there) plus at least one agent plugin (codex,
+# gemini). It checks which agents are set up after every sync and whenever a plugin is installed or
+# removed, so it never assumes all of them, and picks up an agent you add later.
+# An agent takes part when its context plugin is installed and its CLI is used on this PC.
 #
 # Nothing is shared by default. Two ways to share:
-#   Per session  Ask for it ("pull my Codex context"). A skill installed for Claude Code
-#                (~/.claude/skills/olivebranch) and Codex (~/.agents/skills/olivebranch) runs
+#   Per session  Ask for it ("pull my Codex context"). A skill for each taking-part agent
+#                (Claude: ~/.claude/skills, Codex: ~/.agents/skills, Gemini: ~/.gemini/skills) runs
 #                `olive pull`, which prints the other agents' context for the session's project.
 #   Always       Turned on per project, on purpose (`olive on <project>` or Ctrl+P in the project menu).
 #                Then a SessionStart hook (Claude: ~/.claude/settings.json, Codex: ~/.codex/hooks.json)
@@ -15,10 +20,33 @@ $script:OliveMarker = 'olive hook'
 $script:OliveCodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
 $script:OliveAgentsSkills = if ($env:CCM_AGENTS_DIR) { Join-Path $env:CCM_AGENTS_DIR 'skills' } else { Join-Path $HOME '.agents\skills' }
 $script:OliveGeminiHome = if ($env:GEMINI_CLI_HOME) { Join-Path $env:GEMINI_CLI_HOME '.gemini' } else { Join-Path $HOME '.gemini' }
-# where each agent looks for user skills, and the folder that shows the agent is used on this PC
-$script:OliveSkillDirs = [ordered]@{ claude = (Join-Path $ClaudeDir 'skills\olivebranch'); codex = (Join-Path $OliveAgentsSkills 'olivebranch'); gemini = (Join-Path $OliveGeminiHome 'skills\olivebranch') }
-$script:OliveAgentHomes = @{ claude = $ClaudeDir; codex = $OliveCodexHome; gemini = $OliveGeminiHome }
-$script:OliveNames = @{ claude = 'Claude'; codex = 'Codex'; gemini = 'Gemini' }
+# Agents OliveBranch knows how to reach: their config folder (shows the agent is used on this PC), where
+# they load user skills, and the hooks file for always-on (Gemini: no always-on hook yet). Other agent
+# plugins can take part by registering AgentHome and SkillsDir with their context source.
+$script:OliveKnownAgents = [ordered]@{
+    claude = @{ Home = $ClaudeDir; Skills = (Join-Path $ClaudeDir 'skills'); HookFile = (Join-Path $ClaudeDir 'settings.json') }
+    codex  = @{ Home = $OliveCodexHome; Skills = $OliveAgentsSkills; HookFile = (Join-Path $OliveCodexHome 'hooks.json') }
+    gemini = @{ Home = $OliveGeminiHome; Skills = (Join-Path $OliveGeminiHome 'skills'); HookFile = $null }
+}
+Register-ProjectState 'olivebranch'       # renaming a project keeps its always-on setting
+
+# name -> @{ Home; Skills; HookFile } for every agent we could reach (known ones plus plugin-declared ones)
+function Get-OliveAgentInfo {
+    $all = [ordered]@{}
+    foreach ($k in $OliveKnownAgents.Keys) { $all[$k] = $OliveKnownAgents[$k] }
+    foreach ($cs in $ContextSources.Values) {
+        if (-not $all.Contains($cs.Name) -and $cs.AgentHome -and $cs.SkillsDir) { $all[$cs.Name] = @{ Home = $cs.AgentHome; Skills = $cs.SkillsDir; HookFile = $null } }
+    }
+    $all
+}
+
+# Agents taking part right now: their context plugin is installed (Claude is built in) and their CLI is used here
+function Get-OliveAgents {
+    $info = Get-OliveAgentInfo
+    @($ContextSources.Keys | Where-Object { $info.Contains($_) -and (Test-Path -LiteralPath $info[$_].Home) })
+}
+
+function Get-OliveLabel([string]$agent) { if ($ContextSources.Contains($agent)) { $ContextSources[$agent].Label } else { (Get-Culture).TextInfo.ToTitleCase($agent) } }
 
 function Get-OliveScriptPath { (Get-CcmScript) -replace '\\', '/' }
 
@@ -29,7 +57,14 @@ function Test-OliveAlways($config, $project) {
     [bool]($s.Contains($project) -and $s[$project].always)
 }
 
+# Whose context an agent can pull: every other installed context source (even if that agent's CLI isn't on
+# this PC anymore, its saved context still is)
 function Get-OliveOtherAgents([string]$for) { @($ContextSources.Keys | Where-Object { $_ -ne $for }) }
+
+function Get-OliveMissingAgentHint {
+    $missing = @('codex', 'gemini' | Where-Object { -not $ContextSources.Contains($_) })
+    if ($missing) { ($missing | ForEach-Object { "ClaudeContextManager plugin install $_" }) -join '  or  ' } else { 'an agent plugin' }
+}
 
 function Get-OliveOtherLabels([string]$for) {
     $labels = @(Get-OliveOtherAgents $for | ForEach-Object { $ContextSources[$_].Label })
@@ -41,7 +76,7 @@ function Get-OliveContext($config, [string]$for, [string]$project, [switch]$Hook
     $others = Get-OliveOtherAgents $for
     if (-not $others) {
         if ($Hook) { return '' }
-        return 'OliveBranch: no other agents are set up, so there is nothing to bridge. Install one first, for example: ClaudeContextManager plugin install codex'
+        return "OliveBranch: no other agents are set up, so there is nothing to bridge yet. Install one first: $(Get-OliveMissingAgentHint)"
     }
     $labels = Get-OliveOtherLabels $for
     $text = Get-AgentContext $config $project $others -RecentSessions ($Hook ? 2 : 4) -MaxChars ($Hook ? 8500 : 40000)
@@ -64,7 +99,7 @@ function Invoke-OlivePull($config, [string]$for, [string]$project, [string]$cwd)
         $names = (Get-ProjectNames $config | Where-Object { $_ -notin $Unsorted, $Global }) -join ', '
         return "OliveBranch: couldn't tell which project $cwd belongs to. Ask the user which one they mean, then run the command again with --project=`"<name>`".`nProjects: $names"
     }
-    if (-not (Test-Path (Join-Path $config.ContextDir (Get-SafeName $project)))) { return "OliveBranch: there's no project named `"$project`" in the Context folder." }
+    if (-not (Test-Path (Join-Path $config.ContextDir (Get-SafeName $project)))) { return "OliveBranch: project `"$project`" has no saved context yet." }
     Get-OliveContext $config $for $project
 }
 
@@ -118,37 +153,14 @@ function Save-JsonFile($data, [string]$file) {
     $data | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $file -Encoding utf8NoBOM
 }
 
-# Hooks exist only while some project has "always" on
-function Update-OliveHooks($config) {
-    $any = @((Get-OliveSettings $config).Values | Where-Object { $_.always }).Count -gt 0
-    $claudeFile = Join-Path $ClaudeDir 'settings.json'
-    if ($any -or (Test-Path -LiteralPath $claudeFile)) {
-        $s = Read-JsonFile $claudeFile
-        $before = $s | ConvertTo-Json -Depth 100
-        Set-OliveHookEntry $s (Get-OliveHookCommand 'claude') $any
-        if (($s | ConvertTo-Json -Depth 100) -ne $before) { Save-JsonFile $s $claudeFile }
-    }
-    $codexFile = Join-Path $OliveCodexHome 'hooks.json'
-    if ((Test-Path $OliveCodexHome) -and ($any -or (Test-Path -LiteralPath $codexFile))) {
-        $h = Read-JsonFile $codexFile
-        $before = $h | ConvertTo-Json -Depth 100
-        Set-OliveHookEntry $h (Get-OliveHookCommand 'codex') $any
-        if (($h | ConvertTo-Json -Depth 100) -ne $before) {
-            if ($h.Count) { Save-JsonFile $h $codexFile } elseif (Test-Path -LiteralPath $codexFile) { Remove-Item -LiteralPath $codexFile }
-        }
-    }
-}
-
-function Install-OliveSkills {
-    foreach ($for in $OliveSkillDirs.Keys) {
-        if (-not (Test-Path $OliveAgentHomes[$for])) { continue }        # that agent isn't used on this PC
-        $others = @($OliveNames.Keys | Where-Object { $_ -ne $for } | ForEach-Object { $OliveNames[$_] })
-        $example = $others[0]
-        $cmd = "pwsh -NoProfile -File `"$(Get-OliveScriptPath)`" olive pull --for=$for"
-        $skill = @"
+function Get-OliveSkillText([string]$for, [string[]]$others) {
+    $labels = @($others | ForEach-Object { Get-OliveLabel $_ })
+    $example = $labels[0]
+    $cmd = "pwsh -NoProfile -File `"$(Get-OliveScriptPath)`" olive pull --for=$for"
+    @"
 ---
 name: olivebranch
-description: Pull the user's context from their other AI agents ($($others -join ', ')) for the current project, from their ClaudeContextManager Context folder (the other agents' past sessions, notes and instruction files). Use ONLY when the user explicitly asks for context from another agent, e.g. "pull my $example context", "what did $example do on this", or "olive branch". Never use it on your own.
+description: Pull the user's context from their other AI agents ($($labels -join ', ')) for the current project, from their ClaudeContextManager Context folder (the other agents' past sessions, notes and instruction files). Use ONLY when the user explicitly asks for context from another agent, e.g. "pull my $example context", "what did $example do on this", or "olive branch". Never use it on your own.
 ---
 
 # OliveBranch
@@ -167,14 +179,52 @@ you read the other agents' context for this project, only because the user asked
    lists if you need more detail.
 4. Tell the user briefly what you found that's relevant, then continue with their request.
 "@
-        $dir = $OliveSkillDirs[$for]
-        New-Item -ItemType Directory -Force $dir | Out-Null
-        Set-Content (Join-Path $dir 'SKILL.md') $skill -Encoding utf8NoBOM
+}
+
+function Set-FileIfChanged([string]$file, [string]$text) {
+    if ((Test-Path -LiteralPath $file) -and (Get-Content -LiteralPath $file -Raw) -eq $text) { return }
+    New-Item -ItemType Directory -Force (Split-Path $file -Parent) | Out-Null
+    Set-Content -LiteralPath $file -Value $text -Encoding utf8NoBOM -NoNewline
+}
+
+function Set-OliveHookFile([string]$file, [string]$for, [bool]$present) {
+    if (-not $present -and -not (Test-Path -LiteralPath $file)) { return }
+    $data = Read-JsonFile $file
+    $before = $data | ConvertTo-Json -Depth 100
+    Set-OliveHookEntry $data (Get-OliveHookCommand $for) $present
+    if (($data | ConvertTo-Json -Depth 100) -eq $before) { return }
+    if ($data.Count) { Save-JsonFile $data $file }
+    elseif ((Split-Path $file -Leaf) -eq 'hooks.json') { Remove-Item -LiteralPath $file }      # a hooks.json we emptied
+    else { Save-JsonFile $data $file }
+}
+
+# Brings skills and hooks in line with the agents that are set up right now. Runs on install, after every
+# sync, when plugins change and when a project is turned on or off, so adding or removing an agent later
+# just works. With only one agent there is nothing to bridge: no skills, no hooks.
+function Sync-OliveIntegration($config) {
+    $info = Get-OliveAgentInfo
+    $agents = Get-OliveAgents
+    $anyAlways = @((Get-OliveSettings $config).Values | Where-Object { $_.always }).Count -gt 0
+    foreach ($name in $info.Keys) {
+        $others = @(Get-OliveOtherAgents $name)
+        $active = $name -in $agents -and $others.Count -gt 0
+        $skillDir = Join-Path $info[$name].Skills 'olivebranch'
+        if ($active) { Set-FileIfChanged (Join-Path $skillDir 'SKILL.md') (Get-OliveSkillText $name $others) }
+        elseif (Test-Path -LiteralPath (Join-Path $skillDir 'SKILL.md')) { Remove-Item -LiteralPath $skillDir -Recurse -Force }
+        if ($info[$name].HookFile) {
+            # only touch an agent's hooks file when the agent is there (never create ~/.codex for someone without Codex)
+            if (Test-Path -LiteralPath $info[$name].Home) { Set-OliveHookFile $info[$name].HookFile $name ($active -and $anyAlways) }
+        }
     }
 }
 
-function Uninstall-OliveSkills {
-    foreach ($dir in $OliveSkillDirs.Values) { if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force } }
+function Remove-OliveIntegration {
+    $info = Get-OliveAgentInfo
+    foreach ($name in $info.Keys) {
+        $skillDir = Join-Path $info[$name].Skills 'olivebranch'
+        if (Test-Path -LiteralPath (Join-Path $skillDir 'SKILL.md')) { Remove-Item -LiteralPath $skillDir -Recurse -Force }
+        if ($info[$name].HookFile -and (Test-Path -LiteralPath $info[$name].HookFile)) { Set-OliveHookFile $info[$name].HookFile $name $false }
+    }
 }
 
 #endregion
@@ -186,26 +236,41 @@ function Set-OliveAlways($config, [string]$project, [bool]$on) {
     if ($on) { $s[$project] = [ordered]@{ always = $true; since = (Get-Date).ToString('yyyy-MM-dd HH:mm') } }
     else { $s.Remove($project) }
     Write-State $config 'olivebranch' $s
-    Update-OliveHooks $config
+    Sync-OliveIntegration $config
 }
 
 function Show-OliveStatus($config) {
     $s = Get-OliveSettings $config
     $on = @($s.Keys | Where-Object { $s[$_].always })
-    Write-Host "  ${green}OliveBranch$reset  bridges: $((@($ContextSources.Values.Label)) -join ' <-> ')"
-    Write-Host "  Per session: ask your agent, e.g. `"pull my Codex context`" (or /olivebranch in Claude and Gemini, `$olivebranch in Codex)."
+    $agents = @(Get-OliveAgents)
+    $labels = @($agents | ForEach-Object { Get-OliveLabel $_ })
+    Write-Host "  ${green}OliveBranch$reset"
+    if ($agents.Count -lt 2) {
+        Write-Warn "Only $($labels -join ', ') is set up, so there's nothing to bridge yet."
+        Write-Info "Add another agent: $(Get-OliveMissingAgentHint). OliveBranch picks it up on its own."
+        $cli = @($ContextSources.Keys | Where-Object { $_ -notin $agents -and $_ -ne 'claude' } | ForEach-Object { Get-OliveLabel $_ })
+        if ($cli) { Write-Info "($($cli -join ', ') context is installed, but its CLI isn't used on this PC, so it can't ask for context here.)" }
+    } else {
+        Write-Host "  Bridging: $($labels -join ' <-> ')"
+        $howTo = @($agents | ForEach-Object { if ($_ -eq 'codex') { '$olivebranch in Codex' } else { "/olivebranch in $(Get-OliveLabel $_)" } })
+        Write-Host "  Per session: ask your agent, e.g. `"pull my $(Get-OliveLabel ($agents | Where-Object { $_ -ne 'claude' } | Select-Object -First 1)) context`" ($($howTo -join ', '))."
+    }
     if ($on) { Write-Host "  Always on for: $($on -join ', ')" } else { Write-Info 'Always on for: no projects (turn it on with: ClaudeContextManager olive on <project>)' }
 }
 
 function Confirm-OliveOn($project) {
+    $agents = @(Get-OliveAgents)
+    $hooked = @($agents | Where-Object { (Get-OliveAgentInfo)[$_].HookFile } | ForEach-Object { Get-OliveLabel $_ })
     Write-Host "`n  ${green}Turn on OliveBranch for $project$reset"
-    Write-Info "Every new Claude and Codex session in $project's folders will start with the other agents'"
-    Write-Info 'context for this project (its notes, instruction files and recent sessions).'
+    if ($agents.Count -lt 2) { Write-Warn "Only one agent is set up right now; this takes effect once you add another ($(Get-OliveMissingAgentHint))." }
+    Write-Info "Every new $($hooked -join ' and ') session in $project's folders will start with the other agents'"
+    Write-Info 'context for this project (their notes, instruction files and recent sessions).'
+    if ($agents -contains 'gemini') { Write-Info 'Gemini sessions can still ask for it (/olivebranch); they don''t get it automatically yet.' }
     Write-Info 'You can still pull it by hand in any project without this. Turn it off any time.'
     Read-YesNo 'Turn it on?' $false
 }
 
-Register-CcmCommand -Name 'olive' -Usage 'olive on|off <project>, olive status, olive pull --for=claude|codex [--project=<name>]   (OliveBranch plugin)' -Action {
+Register-CcmCommand -Name 'olive' -Usage 'olive on|off <project>, olive status, olive pull --for=<agent> [--project=<name>]   (OliveBranch plugin)' -Action {
     param($params, $flags)
     $config = Get-Config
     $action = if ($params.Count) { $params[0] } else { 'status' }
@@ -221,7 +286,7 @@ Register-CcmCommand -Name 'olive' -Usage 'olive on|off <project>, olive status, 
             if (-not ('--yes' -in $flags) -and -not (Confirm-OliveOn $project)) { Write-Info 'Left off.'; return }
             Set-OliveAlways $config $project $true
             Write-Ok "OliveBranch is on for $project. New sessions there will get the other agents' context."
-            Write-Info 'Codex may ask you to review the new hook the first time (it checks new hooks before running them).'
+            if ((Get-OliveAgents) -contains 'codex') { Write-Info 'Codex may ask you to review the new hook the first time (it checks new hooks before running them).' }
         }
         'off' {
             if (-not $project) { Write-Warn 'Usage: ClaudeContextManager olive off <project>'; return }
@@ -244,15 +309,17 @@ Register-ProjectAction -Label {
 
 Register-PluginLifecycle -Name 'olivebranch' -OnInstall {
     param($config)
-    Install-OliveSkills
-    Update-OliveHooks $config      # re-adds hooks if projects were already on (e.g. after an update)
+    Sync-OliveIntegration $config
+    if (@(Get-OliveAgents).Count -lt 2) {
+        Write-Host "  OliveBranch is installed, but only one agent is set up. Add another and it starts working: $(Get-OliveMissingAgentHint)"
+    }
+} -OnRefresh {
+    param($config)
+    Sync-OliveIntegration $config
 } -OnUninstall {
     param($config)
-    Uninstall-OliveSkills
-    $s = Get-OliveSettings $config
-    foreach ($k in @($s.Keys)) { $s.Remove($k) }
-    Write-State $config 'olivebranch' $s
-    Update-OliveHooks $config
+    Remove-OliveIntegration
+    Write-State $config 'olivebranch' ([ordered]@{})
 }
 
 #endregion

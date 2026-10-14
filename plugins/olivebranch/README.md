@@ -8,7 +8,16 @@ An **opt-in bridge** between your agents: lets Claude read your Codex and Gemini
 ClaudeContextManager plugin install olivebranch
 ```
 
-It's only useful with a second agent, so install [codex](../codex/README.md) and/or [gemini](../gemini/README.md) too.
+It works with **any two or more agents**: Claude plus [codex](../codex/README.md), [gemini](../gemini/README.md), or both. It doesn't need all three.
+
+## Which agents take part
+
+OliveBranch checks which agents are set up instead of assuming. An agent takes part when its context plugin is installed (Claude is built in) and its CLI is used on this PC. It checks again after every sync and whenever you install or remove a plugin. So:
+
+- **Claude only:** nothing to bridge yet. OliveBranch installs no skills or hooks and tells you which plugin to add.
+- **Claude + Codex** or **Claude + Gemini:** those two get the skill and can read each other's context.
+- **Add an agent later:** it's picked up on the next sync or plugin install, with no reinstall needed. Removing a plugin takes its skill and hooks away again.
+- **A plugin installed but its CLI gone from this PC:** Claude can still read that agent's saved context, but that agent gets no skill or hook (and no config folder is created for it).
 
 ## Nothing is shared until you ask
 

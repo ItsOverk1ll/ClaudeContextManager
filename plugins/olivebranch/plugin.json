@@ -1,7 +1,7 @@
 {
   "name": "olivebranch",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Opt-in bridge: let Claude, Codex and Gemini read each other's context, per session or always on for a project",
   "author": "ItsOverk1ll",
-  "minCcmVersion": "1.2.0"
+  "minCcmVersion": "1.3.1"
 }
