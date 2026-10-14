@@ -161,6 +161,34 @@ function Copy-ProjectContext($config, $project) {
     Start-Sleep -Milliseconds 1200
 }
 
+# Ctrl+Enter on a project: choose an agent, then start it in the project's folder with the project's context.
+# (Windows Terminal sends Ctrl+Enter as Ctrl+J; Alt+Enter works too.)
+$script:LaunchKeys = 'ctrl-j', 'alt-enter'
+
+function Start-ProjectAgent($config, [string]$project) {
+    if ($project -in $Unsorted, $Global) { Write-Warn "$project isn't a real project, so there's no folder to open."; Start-Sleep 1; return }
+    $folders = @(Get-ProjectFolders $config $project)
+    if (-not $folders) { Write-Warn "No folder on disk is linked to $project yet (rename/merge it into a project that has one, or open a session there first)."; Start-Sleep 2; return }
+    $agents = @(Get-LaunchAgents)
+    if (-not $agents) { Write-Warn 'No agent commands found (is claude on your PATH?).'; Start-Sleep 2; return }
+    $rows = $agents | ForEach-Object { "$green$($_.Label)$reset $dim$($_.Command)$reset`t$($_.Name)" }
+    $pick = Show-Menu @($rows) "Open $project with" 'Enter choose  ·  Esc back'
+    if (-not $pick) { return }
+    $agent = $agents | Where-Object Name -eq $pick.Row | Select-Object -First 1
+    $folder = $folders[0]
+    if ($folders.Count -gt 1) {
+        $fp = Show-Menu @($folders | ForEach-Object { "$_`t$_" }) "Which folder?" 'Enter choose  ·  Esc back'
+        if (-not $fp) { return }
+        $folder = $fp.Row
+    }
+    Clear-Host
+    Write-Info "Starting $($agent.Label) in $folder ..."
+    $prompt = Get-LaunchPrompt $config $project $agent
+    $agentArgs = @(& $agent.Args $prompt)
+    Push-Location $folder
+    try { & $agent.Command @agentArgs } catch { Write-Warn "$_"; Wait-Key } finally { Pop-Location }
+}
+
 function Show-ProjectActions($config, $project) {
     if (-not $ProjectActions.Count) { return }
     $rows = for ($i = 0; $i -lt $ProjectActions.Count; $i++) { "$(& $ProjectActions[$i].Label $config $project)`t$i" }
@@ -193,10 +221,11 @@ function Show-ProjectMenu($config, $project) {
             $rows += "$dim$($e.updated.Substring(5, 5))$reset$pin{0,-40} $dim{1,-7}{2,3}p$reset`t{3}`t{4}" -f (Get-OneLine $e.title 40), $src, $e.prompts, $s.Key, (Join-Path $config.ContextDir $e.file)
         }
         $header = "Enter open  ·  Ctrl+V move to project  ·  Ctrl+R resume session  ·  Ctrl+F search  ·  Esc back`n" +
-            "Ctrl+W write summary  ·  Ctrl+K clean up  ·  Ctrl+Y copy  ·  Ctrl+D remove  ·  Ctrl+O folder`n" +
+            "Ctrl+W write summary  ·  Ctrl+K clean up  ·  Ctrl+Y copy  ·  Ctrl+D remove  ·  Ctrl+O folder  ·  Ctrl+Enter open agent`n" +
             "$(if ($ProjectActions.Count) { 'Ctrl+P plugins  ·  ' })$green•$reset sorted by hand"
-        $pick = Show-Menu $rows $project $header -Expect 'ctrl-v', 'ctrl-r', 'ctrl-y', 'ctrl-d', 'ctrl-o', 'ctrl-p', 'ctrl-w', 'ctrl-k', 'ctrl-f' -Preview
+        $pick = Show-Menu $rows $project $header -Expect (@('ctrl-v', 'ctrl-r', 'ctrl-y', 'ctrl-d', 'ctrl-o', 'ctrl-p', 'ctrl-w', 'ctrl-k', 'ctrl-f') + $LaunchKeys) -Preview
         if (-not $pick) { return }
+        if ($pick.Key -in $LaunchKeys) { Start-ProjectAgent $config $project; continue }
         if ($pick.Key -eq 'ctrl-o') { Start-Process explorer.exe $dir; continue }
         if ($pick.Key -eq 'ctrl-p') { Show-ProjectActions $config $project; continue }
         if ($pick.Key -eq 'ctrl-f') { Show-Search $config $project; continue }
@@ -515,11 +544,12 @@ function Show-MainMenu {
             $pad = ' ' * [Math]::Max(1, 26 - $name.Length)
             $rows += "$label$pad$dim{0,3} sess {1,2} mem  {2}$reset`t{3}`t{4}" -f $s.Sessions, $s.Memory, $last, $name, (Join-Path $config.ContextDir "$(Get-SafeName $name)\PROJECT.md")
         }
-        $header = "Enter open  ·  Ctrl+S sync  ·  Ctrl+F search  ·  Ctrl+N new project  ·  Esc quit`nCtrl+R rename/merge  ·  Ctrl+Y copy context  ·  Ctrl+W write summary  ·  Ctrl+K clean up  ·  Ctrl+O folder"
-        $pick = Show-Menu $rows 'Claude Context' $header -Expect 'ctrl-s', 'ctrl-n', 'ctrl-r', 'ctrl-y', 'ctrl-o', 'ctrl-f', 'ctrl-w', 'ctrl-k' -Preview
+        $header = "Enter open  ·  Ctrl+S sync  ·  Ctrl+F search  ·  Ctrl+N new project  ·  Esc quit`nCtrl+R rename/merge  ·  Ctrl+Y copy context  ·  Ctrl+W write summary  ·  Ctrl+K clean up  ·  Ctrl+O folder  ·  Ctrl+Enter open agent"
+        $pick = Show-Menu $rows 'Claude Context' $header -Expect (@('ctrl-s', 'ctrl-n', 'ctrl-r', 'ctrl-y', 'ctrl-o', 'ctrl-f', 'ctrl-w', 'ctrl-k') + $LaunchKeys) -Preview
         if (-not $pick) { Clear-Host; return }
         $row = $pick.Row
         $isProject = $row -and -not $row.StartsWith('+')
+        if ($pick.Key -in $LaunchKeys) { if ($isProject) { Start-ProjectAgent $config $row }; continue }
         switch ($pick.Key) {
             'ctrl-s' { $row = '+sync' }
             'ctrl-n' { $row = '+new' }

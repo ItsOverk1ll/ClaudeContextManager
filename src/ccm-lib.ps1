@@ -24,7 +24,7 @@ $script:DesktopDir = Join-Path $env:APPDATA 'Claude'
 $script:Unsorted = 'Unsorted'
 $script:Global = '_Global'
 $script:MemoryRoot = '_Memory'      # memory files live here by agent, not inside projects
-$script:CcmVersion = '1.4.1'
+$script:CcmVersion = '1.5.0'
 $script:PluginDir = Join-Path (Split-Path $ConfigFile -Parent) 'plugins'
 $script:ContextSources = [ordered]@{}
 
@@ -1351,6 +1351,51 @@ function Get-AgentContext($config, [string]$project, [string[]]$Agents, [int]$Re
     if ($text.Length -gt $MaxChars) { $text = $text.Substring(0, $MaxChars) + "`n… (truncated; open the session files listed above for more)" }
     $text
 }
+
+#region Launch an agent in a project
+
+# Agents CCM can start in a project folder: Claude, plus any plugin agent that registers `Launch = @{ Command = 'codex'; Args = { param($prompt) @($prompt) } }`
+# on its context source. Only agents whose command is installed are returned.
+function Get-LaunchAgents {
+    $agents = [Collections.Generic.List[hashtable]]::new()
+    $agents.Add(@{ Name = 'claude'; Label = 'Claude'; Command = 'claude'; Args = { param($prompt) @('--append-system-prompt', $prompt) } })
+    foreach ($cs in $ContextSources.Values | Where-Object { $_.Launch }) {
+        $agents.Add(@{ Name = $cs.Name; Label = $cs.Label; Command = $cs.Launch.Command; Args = $cs.Launch.Args })
+    }
+    @($agents | Where-Object { Get-Command $_.Command -CommandType Application -ErrorAction SilentlyContinue })
+}
+
+# The folders that belong to a project (its path rules that exist on disk)
+function Get-ProjectFolders($config, [string]$project) {
+    $projects = Read-State $config 'projects'
+    if (-not $projects.Contains($project)) { return @() }
+    @($projects[$project].paths | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) } | Select-Object -Unique)
+}
+
+# What an agent is told when CCM starts it in a project. Agents only get their own context: Claude gets the
+# summary (written from Claude's sessions only) and pointers; another agent gets a pointer to its own folder.
+function Get-LaunchPrompt($config, [string]$project, [hashtable]$agent) {
+    $dir = Join-Path $config.ContextDir (Get-SafeName $project)
+    $cs = $ContextSources[$agent.Name]
+    $folder = if ($cs) { $cs.Folder } else { '' }
+    $own = if ($folder) { Join-Path $dir $folder } else { $dir }
+    $sb = [Text.StringBuilder]::new()
+    [void]$sb.AppendLine("This session was started from ClaudeContextManager for the project `"$project`". Earlier context for it is saved as Markdown in $own .")
+    if ($agent.Name -eq 'claude') {
+        [void]$sb.AppendLine("PROJECT.md there indexes the past sessions; sessions\ holds their transcripts and memory\ the memory notes. Read them when you need detail; don't read them all up front.")
+        $sf = Join-Path $dir 'SUMMARY.md'
+        if (Test-Path -LiteralPath $sf) {
+            $t = (Get-Content -LiteralPath $sf -Raw).Trim()
+            if ($t.Length -gt 6000) { $t = $t.Substring(0, 6000) + "`n… (truncated, full file: $sf)" }
+            [void]$sb.AppendLine().AppendLine('Where the previous sessions left off:').AppendLine().AppendLine($t)
+        }
+    } else {
+        [void]$sb.AppendLine("Read what you need from there; don't read it all up front.")
+    }
+    $sb.ToString().Trim()
+}
+
+#endregion
 
 . (Join-Path $PSScriptRoot 'ccm-features.ps1')
 
