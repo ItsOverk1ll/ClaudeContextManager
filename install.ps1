@@ -30,13 +30,16 @@ if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { Write-Host '  GitHub 
 
 New-Item -ItemType Directory -Force $app, $bin | Out-Null
 Copy-Item (Join-Path $PSScriptRoot 'src\*') $app -Recurse -Force
-Set-Content (Join-Path $bin 'ccm.cmd') "@pwsh -NoProfile -ExecutionPolicy Bypass -File `"$app\ccm.ps1`" %*" -Encoding ascii
+# `ccm` and `ClaudeContextManager` both open the menu (and take the same subcommands)
+foreach ($name in 'ccm', 'ClaudeContextManager') {
+    Set-Content (Join-Path $bin "$name.cmd") "@pwsh -NoProfile -ExecutionPolicy Bypass -File `"$app\ccm.ps1`" %*" -Encoding ascii
+}
 
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 if (($userPath -split ';') -notcontains $bin) {
     [Environment]::SetEnvironmentVariable('Path', (@($userPath.TrimEnd(';'), $bin) -join ';').TrimStart(';'), 'User')
 }
 $env:Path = "$env:Path;$bin"
-Write-Host "  Installed to $app. The 'ccm' command works in new terminals."
+Write-Host "  Installed to $app. Type 'ClaudeContextManager' (or 'ccm') in a new terminal to open it."
 
 if (-not $NoSetup -and $firstInstall) { & pwsh -NoProfile -ExecutionPolicy Bypass -File (Join-Path $app 'ccm.ps1') setup }

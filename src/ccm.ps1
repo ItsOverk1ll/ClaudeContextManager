@@ -7,7 +7,7 @@
 #   ccm push            commit and push the Context folder to its GitHub repo
 #   ccm import <path>   import a claude.ai data export (.zip or folder) - Claude Desktop chats
 #   ccm open            open the Context folder in Explorer
-#   ccm uninstall       remove the hook, scheduled task and the ccm command (keeps your Context folder)
+#   ccm uninstall       remove the hook, scheduled task and the ccm / ClaudeContextManager commands (keeps your Context folder)
 
 param([Parameter(Position = 0)][string]$Command = 'menu', [Parameter(Position = 1, ValueFromRemainingArguments)][string[]]$Rest = @())
 
@@ -68,7 +68,7 @@ function Invoke-Setup {
     Write-Info 'It holds your Claude conversations, so it is always created private.'
     if (Read-YesNo 'Create a private GitHub repo for your context?' $true) { Set-Repo $config }
 
-    Write-Host "`n  ${green}All set.$reset Run ${bright}ccm$reset any time to open the menu."
+    Write-Host "`n  ${green}All set.$reset Type ${bright}ClaudeContextManager$reset (or ${bright}ccm$reset) any time to open the menu."
     Write-Info "Claude Desktop chats (not Code sessions) are stored on claude.ai: export them in Claude > Settings >"
     Write-Info "Privacy > Export data, then use Settings > Import in the menu (or: ccm import <zip>)."
     Wait-Key
@@ -310,7 +310,7 @@ function Uninstall-Ccm {
     $newPath = ($path -split ';' | Where-Object { $_ -and $_.TrimEnd('\') -ne $bin }) -join ';'
     if ($newPath -ne $path) { [Environment]::SetEnvironmentVariable('Path', $newPath, 'User') }
     $config = Get-Config
-    Write-Ok "Removed the hook, scheduled task and ccm command. Your Context folder ($($config.ContextDir)) was kept."
+    Write-Ok "Removed the hook, scheduled task and the ccm / ClaudeContextManager commands. Your Context folder ($($config.ContextDir)) was kept."
     Write-Info "Delete $(Join-Path $env:LOCALAPPDATA 'ClaudeContextManager') and $AppDataDir to remove the program files and settings."
 }
 

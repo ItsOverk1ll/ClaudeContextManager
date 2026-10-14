@@ -24,7 +24,7 @@ Setup asks:
 
 | Command | |
 |---|---|
-| `ccm` | open the menu |
+| `ClaudeContextManager` or `ccm` | open the menu (both names take the commands below) |
 | `ccm sync` | sync now (`--push`, `--resort`, `--quiet`) |
 | `ccm push` | commit + push the Context folder |
 | `ccm import <zip>` | import a claude.ai data export |
